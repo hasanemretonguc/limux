@@ -147,6 +147,7 @@ pub(crate) struct AppState {
     _theme_portal_signal: Option<gio::SignalSubscription>,
     _theme_gnome_settings: Option<gio::Settings>,
     _theme_gnome_signal: Option<glib::SignalHandlerId>,
+    _omarchy_theme_monitors: Vec<gio::FileMonitor>,
     _desktop_notification_token_signal: Option<gio::SignalSubscription>,
     _desktop_notification_action_signal: Option<gio::SignalSubscription>,
     _desktop_notification_closed_signal: Option<gio::SignalSubscription>,
@@ -1726,9 +1727,25 @@ fn app_css(background_opacity: f64, config: &app_config::AppConfig) -> String {
     } else {
         ""
     };
+    let (content_bg_rgb, omarchy_css) =
+        if config.appearance.ui_theme == app_config::UiTheme::Omarchy {
+            let palette = crate::omarchy_theme::load_active_palette();
+            let bg_rgb = palette
+                .map(|p| (p.background.r, p.background.g, p.background.b))
+                .unwrap_or(CONTENT_BACKGROUND_RGB);
+            let unread_override = (config.appearance.unread_color
+                != app_config::UnreadColor::default())
+            .then(|| config.appearance.unread_color.css_color());
+            (
+                bg_rgb,
+                crate::omarchy_theme::build_omarchy_css(palette.as_ref(), unread_override),
+            )
+        } else {
+            (CONTENT_BACKGROUND_RGB, String::new())
+        };
     format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
-        build_window_css(background_opacity),
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        build_window_css_with_bg(background_opacity, content_bg_rgb),
         pane::PANE_CSS,
         crate::terminal::CLIPBOARD_TOAST_CSS,
         keybind_editor::KEYBIND_EDITOR_CSS,
@@ -1737,6 +1754,7 @@ fn app_css(background_opacity: f64, config: &app_config::AppConfig) -> String {
         ssd_css,
         workspace_color::workspace_color_css(),
         sidebar_groups::workspace_group_css(),
+        omarchy_css,
     )
 }
 
@@ -2112,6 +2130,7 @@ pub fn build_window(app: &adw::Application) {
         _theme_portal_signal: None,
         _theme_gnome_settings: None,
         _theme_gnome_signal: None,
+        _omarchy_theme_monitors: Vec::new(),
         _desktop_notification_token_signal: None,
         _desktop_notification_action_signal: None,
         _desktop_notification_closed_signal: None,
@@ -2197,9 +2216,28 @@ pub fn build_window(app: &adw::Application) {
         )
     });
     {
+        let state_for_watch = state.clone();
+        let style_manager_for_watch = style_manager.clone();
+        let omarchy_monitors = crate::omarchy_theme::watch_omarchy_theme(move || {
+            let (config_snapshot, system_prefers_dark) = {
+                let s = state_for_watch.borrow();
+                let cfg = s.config.borrow().clone();
+                let prefers_dark = s.system_prefers_dark.get();
+                (cfg, prefers_dark)
+            };
+            if config_snapshot.appearance.ui_theme == app_config::UiTheme::Omarchy {
+                apply_appearance(
+                    &style_manager_for_watch,
+                    system_prefers_dark,
+                    &config_snapshot.appearance,
+                );
+                reload_app_css(&state_for_watch, &config_snapshot);
+            }
+        });
         let mut s = state.borrow_mut();
         s._theme_gnome_settings = gnome_interface_settings.clone();
         s._theme_gnome_signal = theme_gnome_signal;
+        s._omarchy_theme_monitors = omarchy_monitors;
     }
     connect_portal_appearance_watch_async(
         gnome_interface_settings.clone(),
@@ -2450,9 +2488,13 @@ fn base_css_for_runtime_gtk() -> std::borrow::Cow<'static, str> {
     }
 }
 
+#[cfg(test)]
 fn build_window_css(background_opacity: f64) -> String {
+    build_window_css_with_bg(background_opacity, CONTENT_BACKGROUND_RGB)
+}
+
+fn build_window_css_with_bg(background_opacity: f64, (r, g, b): (u8, u8, u8)) -> String {
     let background_opacity = sanitize_background_opacity(background_opacity);
-    let (r, g, b) = CONTENT_BACKGROUND_RGB;
     let base_css = base_css_for_runtime_gtk();
     format!(
         "{base_css}\n.limux-content {{\n    background-color: rgba({r}, {g}, {b}, {background_opacity:.3});\n}}\n"
@@ -3042,6 +3084,7 @@ fn handle_config_change(
     apply_appearance(&style_manager, system_prefers_dark, &updated.appearance);
     if updated.appearance.ui_scale != previous.appearance.ui_scale
         || updated.appearance.unread_color != previous.appearance.unread_color
+        || updated.appearance.ui_theme != previous.appearance.ui_theme
     {
         reload_app_css(state, updated);
     }
@@ -3060,6 +3103,7 @@ fn handle_config_change(
         apply_appearance(&style_manager, system_prefers_dark, &previous.appearance);
         if updated.appearance.ui_scale != previous.appearance.ui_scale
             || updated.appearance.unread_color != previous.appearance.unread_color
+            || updated.appearance.ui_theme != previous.appearance.ui_theme
         {
             reload_app_css(state, previous);
         }
@@ -3634,8 +3678,30 @@ fn apply_appearance(
     system_prefers_dark: Option<bool>,
     appearance: &app_config::AppearanceConfig,
 ) {
-    style_manager.set_color_scheme(adw_color_scheme_for(appearance.color_scheme));
-    sync_ghostty_color_scheme_for_config(style_manager, system_prefers_dark, appearance);
+    let effective_scheme = if appearance.ui_theme == app_config::UiTheme::Omarchy
+        && appearance.color_scheme == app_config::ColorScheme::System
+    {
+        crate::omarchy_theme::load_active_palette()
+            .map(|palette| {
+                if palette.is_dark {
+                    app_config::ColorScheme::Dark
+                } else {
+                    app_config::ColorScheme::Light
+                }
+            })
+            .unwrap_or(appearance.color_scheme)
+    } else {
+        appearance.color_scheme
+    };
+    style_manager.set_color_scheme(adw_color_scheme_for(effective_scheme));
+    let effective_system_dark = if appearance.ui_theme == app_config::UiTheme::Omarchy {
+        crate::omarchy_theme::load_active_palette()
+            .map(|palette| palette.is_dark)
+            .or(system_prefers_dark)
+    } else {
+        system_prefers_dark
+    };
+    sync_ghostty_color_scheme_for_config(style_manager, effective_system_dark, appearance);
 }
 
 /// Detach a widget from its current parent, if it has one. Safe to call
