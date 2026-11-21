@@ -104,6 +104,8 @@ pub(crate) struct AppState {
     top_bar_open_folder_btn_ref: Option<gtk::Button>,
     top_bar_settings_btn: Option<gtk::Button>,
     ai_usage_badge: gtk::Label,
+    issues_toggle_btn: gtk::Button,
+    issues_panel: crate::github_issues::IssuesPanel,
     sidebar_header: gtk::Box,
     sidebar_header_handle: gtk::WindowHandle,
     sidebar_drag_area: gtk::Box,
@@ -1749,7 +1751,7 @@ fn app_css(background_opacity: f64, config: &app_config::AppConfig) -> String {
             (CONTENT_BACKGROUND_RGB, String::new())
         };
     format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         build_window_css_with_bg(background_opacity, content_bg_rgb),
         pane::PANE_CSS,
         crate::terminal::CLIPBOARD_TOAST_CSS,
@@ -1762,6 +1764,7 @@ fn app_css(background_opacity: f64, config: &app_config::AppConfig) -> String {
         crate::project_picker::PROJECT_PICKER_CSS,
         crate::ai_usage::AI_USAGE_CSS,
         crate::workspace_stage::WORKSPACE_STAGE_CSS,
+        crate::github_issues::GITHUB_ISSUES_CSS,
         omarchy_css,
     )
 }
@@ -2004,6 +2007,13 @@ pub fn build_window(app: &adw::Application) {
         .build();
     ai_usage_badge.add_css_class("limux-ai-usage-badge");
 
+    let issues_toggle_btn = gtk::Button::with_label("Issues");
+    issues_toggle_btn.add_css_class("flat");
+    issues_toggle_btn.add_css_class("limux-issues-toggle-btn");
+    issues_toggle_btn.set_focus_on_click(false);
+    issues_toggle_btn.set_valign(gtk::Align::Center);
+    issues_toggle_btn.set_tooltip_text(Some("Toggle GitHub Issues & AI Agent panel"));
+
     let header = gtk::WindowHandle::builder().child(&top_bar_content).build();
 
     let stack = gtk::Stack::new();
@@ -2104,6 +2114,17 @@ pub fn build_window(app: &adw::Application) {
     stage_host.append(&stack);
 
     let (main_split, sidebar_shell, sidebar_handle) = build_sidebar_split(&sidebar, &stage_host);
+    let issues_launch_state_slot: Rc<RefCell<Option<State>>> = Rc::new(RefCell::new(None));
+    let issues_panel = {
+        let state_slot = issues_launch_state_slot.clone();
+        crate::github_issues::IssuesPanel::new(Rc::new(move |ws_id, tab_title, command| {
+            let Some(state) = state_slot.borrow().clone() else {
+                return;
+            };
+            launch_agent_command_in_workspace(&state, &ws_id, &tab_title, &command);
+        }))
+    };
+    main_split.append(issues_panel.widget());
 
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     vbox.append(&header);
@@ -2123,6 +2144,8 @@ pub fn build_window(app: &adw::Application) {
         top_bar_open_folder_btn_ref: Some(top_bar_open_folder_btn.clone()),
         top_bar_settings_btn: Some(top_bar_settings_btn.clone()),
         ai_usage_badge: ai_usage_badge.clone(),
+        issues_toggle_btn: issues_toggle_btn.clone(),
+        issues_panel: issues_panel.clone(),
         sidebar_header: sidebar_header.clone(),
         sidebar_header_handle: sidebar_header_handle.clone(),
         sidebar_drag_area: sidebar_drag_area.clone(),
@@ -2176,6 +2199,22 @@ pub fn build_window(app: &adw::Application) {
     CONTROL_STATE.with(|slot| {
         *slot.borrow_mut() = Some(state.clone());
     });
+    *issues_launch_state_slot.borrow_mut() = Some(state.clone());
+    {
+        let state = state.clone();
+        issues_toggle_btn.connect_clicked(move |_| {
+            let (ws_id, folder_path, panel) = {
+                let s = state.borrow();
+                let ws = s.active_workspace();
+                (
+                    ws.map(|w| w.id.clone()),
+                    ws.and_then(|w| w.folder_path.clone()),
+                    s.issues_panel.clone(),
+                )
+            };
+            panel.toggle(ws_id, folder_path);
+        });
+    }
 
     {
         let state = state.clone();
@@ -3960,10 +3999,11 @@ fn active_workspace_focused_or_leading_pane(state: &State) -> Option<gtk::Widget
 }
 
 fn sync_ai_usage_badge_parent(state: &State, show_top_bar: bool) {
-    let (badge, top_bar_content, indicator_scroll) = {
+    let (badge, issues_btn, top_bar_content, indicator_scroll) = {
         let s = state.borrow();
         (
             s.ai_usage_badge.clone(),
+            s.issues_toggle_btn.clone(),
             s.top_bar_content.clone(),
             s.indicator_scroll.clone(),
         )
@@ -3974,6 +4014,10 @@ fn sync_ai_usage_badge_parent(state: &State, show_top_bar: bool) {
             if badge.parent().as_ref() != Some(content.upcast_ref::<gtk::Widget>()) {
                 detach(&badge);
                 badge.insert_after(&content, Some(&indicator_scroll));
+            }
+            if issues_btn.parent().as_ref() != Some(content.upcast_ref::<gtk::Widget>()) {
+                detach(&issues_btn);
+                issues_btn.insert_after(&content, Some(&badge));
             }
         }
         return;
@@ -3986,6 +4030,32 @@ fn sync_ai_usage_badge_parent(state: &State, show_top_bar: bool) {
             detach(&badge);
             trailing.append(&badge);
         }
+        if issues_btn.parent().as_ref() != Some(trailing.upcast_ref::<gtk::Widget>()) {
+            detach(&issues_btn);
+            trailing.append(&issues_btn);
+        }
+    }
+}
+
+fn launch_agent_command_in_workspace(state: &State, ws_id: &str, tab_title: &str, command: &str) {
+    let (pane_widget, folder_path) = {
+        let s = state.borrow();
+        let Some(ws) = s.workspaces.iter().find(|w| w.id == ws_id) else {
+            return;
+        };
+        let root = ws.root.clone();
+        let folder = ws.folder_path.clone();
+        drop(s);
+        (first_leaf_pane(&root), folder)
+    };
+
+    pane::add_terminal_tab_to_pane_in_directory(&pane_widget, folder_path.as_deref());
+    if let Some((tab_id, handle)) = pane::active_tab_terminal_handle(&pane_widget) {
+        pane::set_auto_tab_title_in_pane(&pane_widget, &tab_id, tab_title);
+        let cmd = format!("{command}\r");
+        glib::timeout_add_local_once(std::time::Duration::from_millis(350), move || {
+            let _ = handle.send_text(&cmd);
+        });
     }
 }
 
@@ -8692,6 +8762,20 @@ fn switch_workspace_with_focus(state: &State, idx: usize, focus_entrypoint: bool
     // If the dock toggle is parked on a pane (top-bar off, sidebar closed),
     // move it to the new active workspace's leading pane.
     apply_top_bar_mode(state);
+    {
+        let (ws_id, folder_path, panel) = {
+            let s = state.borrow();
+            let ws = s.active_workspace();
+            (
+                ws.map(|w| w.id.clone()),
+                ws.and_then(|w| w.folder_path.clone()),
+                s.issues_panel.clone(),
+            )
+        };
+        if panel.is_visible() {
+            panel.set_workspace(ws_id, folder_path);
+        }
+    }
     request_session_save(state);
 }
 
@@ -8772,6 +8856,16 @@ fn focus_staged_workspace(state: &State, workspace_id: &str) {
             focus_workspace_entrypoint(&focus_root);
         });
         apply_top_bar_mode(state);
+        let (folder_path, panel) = {
+            let s = state.borrow();
+            (
+                s.active_workspace().and_then(|w| w.folder_path.clone()),
+                s.issues_panel.clone(),
+            )
+        };
+        if panel.is_visible() {
+            panel.set_workspace(Some(workspace_id.to_string()), folder_path);
+        }
     } else {
         switch_workspace(state, idx);
         sidebar_list.select_row(Some(&row));

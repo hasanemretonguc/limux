@@ -5,6 +5,7 @@ mod browser_link;
 mod browser_sandbox;
 mod control_bridge;
 mod ghostty_config;
+mod github_issues;
 mod gui_hooks;
 mod ime;
 mod input_seats;
