@@ -252,6 +252,63 @@ impl UiScale {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AiTabTitleBackend {
+    #[default]
+    Off,
+    Auto,
+    Gemini,
+    ClaudeHaiku,
+}
+
+impl AiTabTitleBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+            Self::Gemini => "gemini",
+            Self::ClaudeHaiku => "claude_haiku",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "off" => Some(Self::Off),
+            "auto" => Some(Self::Auto),
+            "gemini" => Some(Self::Gemini),
+            "claude_haiku" => Some(Self::ClaudeHaiku),
+            _ => None,
+        }
+    }
+
+    pub fn labels() -> &'static [&'static str] {
+        &[
+            "Off",
+            "Auto (Gemini / Claude Haiku)",
+            "Gemini CLI",
+            "Claude Haiku",
+        ]
+    }
+
+    pub fn dropdown_index(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::Auto => 1,
+            Self::Gemini => 2,
+            Self::ClaudeHaiku => 3,
+        }
+    }
+
+    pub fn from_dropdown_index(index: u32) -> Self {
+        match index {
+            1 => Self::Auto,
+            2 => Self::Gemini,
+            3 => Self::ClaudeHaiku,
+            _ => Self::Off,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InterfaceConfig {
     pub window_controls_side: WindowControlsSide,
@@ -259,6 +316,8 @@ pub struct InterfaceConfig {
     pub show_workspace_indicators: bool,
     pub show_tab_activity: bool,
     pub tab_activity_seconds: u32,
+    pub show_ai_usage: bool,
+    pub ai_tab_titles: AiTabTitleBackend,
 }
 
 impl Default for InterfaceConfig {
@@ -269,6 +328,8 @@ impl Default for InterfaceConfig {
             show_workspace_indicators: true,
             show_tab_activity: true,
             tab_activity_seconds: DEFAULT_TAB_ACTIVITY_SECONDS,
+            show_ai_usage: true,
+            ai_tab_titles: AiTabTitleBackend::default(),
         }
     }
 }
@@ -621,6 +682,17 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .map(|seconds| seconds as u32)
         .unwrap_or(DEFAULT_TAB_ACTIVITY_SECONDS);
 
+    let show_ai_usage = interface_obj
+        .and_then(|interface| interface.get("show_ai_usage"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let ai_tab_titles = interface_obj
+        .and_then(|interface| interface.get("ai_tab_titles"))
+        .and_then(Value::as_str)
+        .and_then(AiTabTitleBackend::from_str)
+        .unwrap_or_default();
+
     AppConfig {
         focus: FocusConfig {
             hover_terminal_focus,
@@ -650,6 +722,8 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             show_workspace_indicators,
             show_tab_activity,
             tab_activity_seconds,
+            show_ai_usage,
+            ai_tab_titles,
         },
         links: LinkConfig { open_destination },
         font_size,
@@ -729,16 +803,37 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
             "copy_selection_to_clipboard": config.clipboard.copy_selection_to_clipboard,
         }),
     );
-    root.insert(
-        "interface".to_string(),
-        json!({
-            "window_controls_side": config.interface.window_controls_side.as_str(),
-            "show_top_bar": config.interface.show_top_bar,
-            "show_workspace_indicators": config.interface.show_workspace_indicators,
-            "show_tab_activity": config.interface.show_tab_activity,
-            "tab_activity_seconds": config.interface.tab_activity_seconds,
-        }),
+    let mut interface_map = serde_json::Map::new();
+    interface_map.insert(
+        "window_controls_side".to_string(),
+        json!(config.interface.window_controls_side.as_str()),
     );
+    interface_map.insert(
+        "show_top_bar".to_string(),
+        json!(config.interface.show_top_bar),
+    );
+    interface_map.insert(
+        "show_workspace_indicators".to_string(),
+        json!(config.interface.show_workspace_indicators),
+    );
+    interface_map.insert(
+        "show_tab_activity".to_string(),
+        json!(config.interface.show_tab_activity),
+    );
+    interface_map.insert(
+        "tab_activity_seconds".to_string(),
+        json!(config.interface.tab_activity_seconds),
+    );
+    if !config.interface.show_ai_usage {
+        interface_map.insert("show_ai_usage".to_string(), json!(false));
+    }
+    if config.interface.ai_tab_titles != AiTabTitleBackend::default() {
+        interface_map.insert(
+            "ai_tab_titles".to_string(),
+            json!(config.interface.ai_tab_titles.as_str()),
+        );
+    }
+    root.insert("interface".to_string(), Value::Object(interface_map));
     root.insert(
         "links".to_string(),
         json!({ "open_destination": config.links.open_destination.as_str() }),
@@ -911,6 +1006,7 @@ mod tests {
                     show_workspace_indicators: false,
                     show_tab_activity: false,
                     tab_activity_seconds: 12,
+                    ..InterfaceConfig::default()
                 },
                 links: LinkConfig {
                     open_destination: LinkOpenDestination::BrowserTab,
@@ -1632,5 +1728,25 @@ mod tests {
         let loaded = load_from_path(&path);
         assert!(loaded.warnings.is_empty());
         assert_eq!(loaded.config.appearance.ui_theme, UiTheme::Default);
+    }
+
+    #[test]
+    fn ai_interface_settings_round_trip() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+
+        let mut config = AppConfig::default();
+        config.interface.show_ai_usage = false;
+        config.interface.ai_tab_titles = AiTabTitleBackend::ClaudeHaiku;
+        save_to_path(&path, &config).expect("save ai interface settings");
+
+        let loaded = load_from_path(&path);
+        assert!(loaded.warnings.is_empty());
+        assert!(!loaded.config.interface.show_ai_usage);
+        assert_eq!(
+            loaded.config.interface.ai_tab_titles,
+            AiTabTitleBackend::ClaudeHaiku
+        );
     }
 }

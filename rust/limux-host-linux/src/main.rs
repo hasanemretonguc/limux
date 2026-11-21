@@ -1,3 +1,5 @@
+mod ai_tab_title;
+mod ai_usage;
 mod app_config;
 mod browser_link;
 mod browser_sandbox;
@@ -11,6 +13,7 @@ mod layout_state;
 mod link_uri;
 mod omarchy_theme;
 mod pane;
+mod project_picker;
 mod session_store;
 mod settings_editor;
 mod shortcut_config;

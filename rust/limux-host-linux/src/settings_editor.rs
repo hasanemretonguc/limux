@@ -6,8 +6,9 @@ use gtk4 as gtk;
 use libadwaita as adw;
 
 use crate::app_config::{
-    AppConfig, ColorScheme, LinkOpenDestination, NotificationSound, UiScale, UiTheme, UnreadColor,
-    WindowControlsSide, DEFAULT_UI_SCALE, MAX_TAB_ACTIVITY_SECONDS, MIN_TAB_ACTIVITY_SECONDS,
+    AiTabTitleBackend, AppConfig, ColorScheme, LinkOpenDestination, NotificationSound, UiScale,
+    UiTheme, UnreadColor, WindowControlsSide, DEFAULT_UI_SCALE, MAX_TAB_ACTIVITY_SECONDS,
+    MIN_TAB_ACTIVITY_SECONDS,
 };
 use crate::gui_hooks::{GuiHook, GuiHookEvent, GuiHooksConfig};
 use crate::keybind_editor;
@@ -732,8 +733,77 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     controls_row.set_activatable_widget(Some(&controls_dropdown));
     group.add(&controls_row);
 
+    let ai_usage_row = adw::ActionRow::builder()
+        .title("AI usage indicator")
+        .subtitle("Show active AI tool token and cost usage in the top-right")
+        .build();
+    ai_usage_row.set_title_lines(1);
+    ai_usage_row.set_subtitle_lines(2);
+    let ai_usage_switch = gtk::Switch::new();
+    ai_usage_switch.set_active(input.config.borrow().interface.show_ai_usage);
+    ai_usage_switch.set_valign(gtk::Align::Center);
+    ai_usage_row.add_suffix(&ai_usage_switch);
+    ai_usage_row.set_activatable_widget(Some(&ai_usage_switch));
+    group.add(&ai_usage_row);
+
+    let ai_titles_row = adw::ActionRow::builder()
+        .title("AI tab titles")
+        .subtitle(
+            "Automatically update terminal tab titles from live status via Gemini or Claude Haiku CLI",
+        )
+        .build();
+    ai_titles_row.set_title_lines(1);
+    ai_titles_row.set_subtitle_lines(2);
+    let ai_titles_dropdown = gtk::DropDown::from_strings(AiTabTitleBackend::labels());
+    ai_titles_dropdown.set_selected(
+        input
+            .config
+            .borrow()
+            .interface
+            .ai_tab_titles
+            .dropdown_index(),
+    );
+    ai_titles_dropdown.set_valign(gtk::Align::Center);
+    ai_titles_row.add_suffix(&ai_titles_dropdown);
+    ai_titles_row.set_activatable_widget(Some(&ai_titles_dropdown));
+    group.add(&ai_titles_row);
+
     page.add(&group);
 
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        ai_usage_switch.connect_active_notify(move |switch| {
+            let show_ai_usage = switch.is_active();
+            apply_config_change(&config, &*on_changed, move |c| {
+                c.interface.show_ai_usage = show_ai_usage;
+            });
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        let syncing = Rc::new(Cell::new(false));
+        ai_titles_dropdown.connect_selected_notify(move |dropdown| {
+            if syncing.get() {
+                return;
+            }
+            let backend = AiTabTitleBackend::from_dropdown_index(dropdown.selected());
+            if backend == config.borrow().interface.ai_tab_titles {
+                return;
+            }
+            let effective = apply_config_change(&config, &*on_changed, move |c| {
+                c.interface.ai_tab_titles = backend;
+            })
+            .interface
+            .ai_tab_titles;
+            if dropdown.selected() != effective.dropdown_index() {
+                syncing.set(true);
+                dropdown.set_selected(effective.dropdown_index());
+                syncing.set(false);
+            }
+        });
+    }
     {
         let config = input.config.clone();
         let on_changed = input.on_config_changed.clone();

@@ -642,7 +642,14 @@ pub fn create_pane(
     actions.append(&split_v_btn);
     actions.append(&close_btn);
 
+    let trailing_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(0)
+        .build();
+    trailing_box.add_css_class("limux-pane-trailing");
+
     header.append(&tab_overlay);
+    header.append(&trailing_box);
     header.append(&actions);
 
     outer.append(&header);
@@ -677,6 +684,7 @@ pub fn create_pane(
         content_drop_overlay: content_drop_overlay.clone(),
         pane_outer: outer.clone(),
         leading_box: leading_box.clone(),
+        trailing_box: trailing_box.clone(),
         callbacks: callbacks.clone(),
         working_directory: ws_wd.clone(),
         workspace_dragging: workspace_dragging.clone(),
@@ -975,6 +983,47 @@ pub fn rename_tab_in_pane(pane_widget: &gtk::Widget, tab_id: &str, title: &str) 
 
     entry.rename(title);
     true
+}
+
+/// Update a tab's automatic status title without overriding manual user renames.
+pub fn set_auto_tab_title_in_pane(pane_widget: &gtk::Widget, tab_id: &str, title: &str) -> bool {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return false;
+    };
+
+    let mut tab_state = internals.tab_state.borrow_mut();
+    let Some(entry) = tab_state.tabs.iter_mut().find(|entry| entry.id == tab_id) else {
+        return false;
+    };
+
+    if entry.custom_name.is_some() {
+        return false;
+    }
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    entry.automatic_title = Some(trimmed.to_string());
+    entry.title_label.set_text(trimmed);
+    true
+}
+
+/// Return the active terminal tab's `(tab_id, TerminalHandle)` for a pane, if any.
+pub fn active_tab_terminal_handle(
+    pane_widget: &gtk::Widget,
+) -> Option<(String, terminal::TerminalHandle)> {
+    let internals = find_pane_internals(pane_widget)?;
+    let tab_state = internals.tab_state.borrow();
+    let active_id = tab_state.active_tab.as_deref()?;
+    tab_state.tabs.iter().find_map(|entry| {
+        if entry.id != active_id {
+            return None;
+        }
+        match &entry.kind {
+            TabKind::Terminal { state } => Some((entry.id.clone(), state.handle.clone())),
+            _ => None,
+        }
+    })
 }
 
 /// Pin or unpin a tab. Pinned tabs refuse to close (see `close_tab_in_pane`).
@@ -1435,6 +1484,7 @@ pub struct PaneInternals {
     content_drop_overlay: gtk::Box,
     pane_outer: gtk::Box,
     leading_box: gtk::Box,
+    trailing_box: gtk::Box,
     callbacks: Rc<PaneCallbacks>,
     working_directory: Rc<std::cell::RefCell<Option<String>>>,
     workspace_dragging: Rc<Cell<bool>>,
@@ -2819,8 +2869,16 @@ fn find_pane_internals(pane_widget: &gtk::Widget) -> Option<Rc<PaneInternals>> {
 /// Returns the leading slot (at the very start of the pane header) so the
 /// outer app can place widgets there (e.g. a dock toggle). The box stays
 /// empty by default.
+pub fn pane_id(pane_widget: &gtk::Widget) -> Option<u32> {
+    find_pane_internals(pane_widget).map(|internals| internals.pane_id)
+}
+
 pub fn pane_leading_box(pane_widget: &gtk::Widget) -> Option<gtk::Box> {
     find_pane_internals(pane_widget).map(|internals| internals.leading_box.clone())
+}
+
+pub fn pane_trailing_box(pane_widget: &gtk::Widget) -> Option<gtk::Box> {
+    find_pane_internals(pane_widget).map(|internals| internals.trailing_box.clone())
 }
 
 /// A pane that has not been closed: `retire_pane` drops its internals but

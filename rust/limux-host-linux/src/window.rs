@@ -103,6 +103,7 @@ pub(crate) struct AppState {
     top_bar_new_ws_btn_ref: Option<gtk::Button>,
     top_bar_open_folder_btn_ref: Option<gtk::Button>,
     top_bar_settings_btn: Option<gtk::Button>,
+    ai_usage_badge: gtk::Label,
     sidebar_header: gtk::Box,
     sidebar_header_handle: gtk::WindowHandle,
     sidebar_drag_area: gtk::Box,
@@ -1744,7 +1745,7 @@ fn app_css(background_opacity: f64, config: &app_config::AppConfig) -> String {
             (CONTENT_BACKGROUND_RGB, String::new())
         };
     format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         build_window_css_with_bg(background_opacity, content_bg_rgb),
         pane::PANE_CSS,
         crate::terminal::CLIPBOARD_TOAST_CSS,
@@ -1754,6 +1755,8 @@ fn app_css(background_opacity: f64, config: &app_config::AppConfig) -> String {
         ssd_css,
         workspace_color::workspace_color_css(),
         sidebar_groups::workspace_group_css(),
+        crate::project_picker::PROJECT_PICKER_CSS,
+        crate::ai_usage::AI_USAGE_CSS,
         omarchy_css,
     )
 }
@@ -1978,6 +1981,12 @@ pub fn build_window(app: &adw::Application) {
         close_btn.set_visible(false);
     }
 
+    let ai_usage_badge = gtk::Label::builder()
+        .valign(gtk::Align::Center)
+        .visible(false)
+        .build();
+    ai_usage_badge.add_css_class("limux-ai-usage-badge");
+
     let header = gtk::WindowHandle::builder().child(&top_bar_content).build();
 
     let stack = gtk::Stack::new();
@@ -2089,6 +2098,7 @@ pub fn build_window(app: &adw::Application) {
         top_bar_new_ws_btn_ref: Some(top_bar_new_ws_btn.clone()),
         top_bar_open_folder_btn_ref: Some(top_bar_open_folder_btn.clone()),
         top_bar_settings_btn: Some(top_bar_settings_btn.clone()),
+        ai_usage_badge: ai_usage_badge.clone(),
         sidebar_header: sidebar_header.clone(),
         sidebar_header_handle: sidebar_header_handle.clone(),
         sidebar_drag_area: sidebar_drag_area.clone(),
@@ -2247,6 +2257,7 @@ pub fn build_window(app: &adw::Application) {
         portal_color_scheme_preference.clone(),
     );
     connect_desktop_notification_watch_async(state.clone());
+    start_ai_background_loops(&state);
 
     apply_shortcuts_to_application(app, &state.borrow().shortcuts);
 
@@ -3117,6 +3128,11 @@ fn handle_config_change(
         show_runtime_error(state, "Failed to save settings", &detail);
         return;
     }
+    if previous.interface.show_ai_usage != updated.interface.show_ai_usage
+        && !updated.interface.show_ai_usage
+    {
+        state.borrow().ai_usage_badge.set_visible(false);
+    }
     if previous.interface.show_tab_activity != updated.interface.show_tab_activity
         || previous.interface.tab_activity_seconds != updated.interface.tab_activity_seconds
     {
@@ -3865,6 +3881,7 @@ fn apply_top_bar_mode_impl(state: &State, allow_retry: bool) {
 
     if show_top_bar {
         layout_top_bar_visible(&widgets, controls_side);
+        sync_ai_usage_badge_parent(state, true);
         return;
     }
 
@@ -3875,6 +3892,246 @@ fn apply_top_bar_mode_impl(state: &State, allow_retry: bool) {
         layout_sidebar_header(&widgets, controls_side);
     } else {
         layout_collapsed_dock(state, &widgets, allow_retry);
+    }
+    sync_ai_usage_badge_parent(state, false);
+}
+
+fn active_workspace_focused_or_leading_pane(state: &State) -> Option<gtk::Widget> {
+    let s = state.borrow();
+    if let Some(target) = s.last_focused_surface.as_ref() {
+        if let Some(pane) = target.pane_widget.upgrade() {
+            if s.active_workspace()
+                .is_some_and(|ws| ws.split_container.contains(&pane))
+            {
+                return Some(pane);
+            }
+        }
+    }
+    let root = s.active_workspace().map(|ws| ws.root.clone())?;
+    drop(s);
+    Some(first_leaf_pane(&root))
+}
+
+fn sync_ai_usage_badge_parent(state: &State, show_top_bar: bool) {
+    let (badge, top_bar_content, indicator_scroll) = {
+        let s = state.borrow();
+        (
+            s.ai_usage_badge.clone(),
+            s.top_bar_content.clone(),
+            s.indicator_scroll.clone(),
+        )
+    };
+
+    if show_top_bar {
+        if let Some(content) = top_bar_content {
+            if badge.parent().as_ref() != Some(content.upcast_ref::<gtk::Widget>()) {
+                detach(&badge);
+                badge.insert_after(&content, Some(&indicator_scroll));
+            }
+        }
+        return;
+    }
+
+    if let Some(trailing) = active_workspace_focused_or_leading_pane(state)
+        .and_then(|pane| pane::pane_trailing_box(&pane))
+    {
+        if badge.parent().as_ref() != Some(trailing.upcast_ref::<gtk::Widget>()) {
+            detach(&badge);
+            trailing.append(&badge);
+        }
+    }
+}
+
+fn start_ai_background_loops(state: &State) {
+    // 1. Live AI usage HUD refresh (every 5 seconds).
+    {
+        let weak_state = Rc::downgrade(state);
+        let in_flight = Rc::new(Cell::new(false));
+        glib::timeout_add_local(std::time::Duration::from_secs(5), move || {
+            let Some(state) = weak_state.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let (show_usage, show_top_bar, workspace_id, cwd) = {
+                let s = state.borrow();
+                let cfg = s.config.borrow();
+                let show_usage = cfg.interface.show_ai_usage;
+                let show_top_bar = top_bar_should_be_visible(
+                    cfg.interface.show_top_bar,
+                    s.top_bar_visible,
+                    gtk::prelude::GtkWindowExt::is_fullscreen(&s.window),
+                );
+                let ws = s.active_workspace();
+                let ws_id = ws.map(|w| w.id.clone());
+                let ws_cwd = ws.and_then(|w| w.folder_path.clone());
+                (show_usage, show_top_bar, ws_id, ws_cwd)
+            };
+
+            if !show_usage {
+                state.borrow().ai_usage_badge.set_visible(false);
+                return glib::ControlFlow::Continue;
+            }
+
+            sync_ai_usage_badge_parent(&state, show_top_bar);
+
+            if in_flight.get() {
+                return glib::ControlFlow::Continue;
+            }
+
+            let (surface_id, tab_title, tab_cwd) = active_workspace_focused_or_leading_pane(&state)
+                .map(|pane_widget| {
+                    let pane_id = pane::pane_id(&pane_widget);
+                    let active_tab = pane::active_tab_in_pane(&pane_widget);
+                    let surface = pane_id
+                        .zip(active_tab.as_deref())
+                        .map(|(pid, tid)| format!("{pid}:{tid}"));
+                    let title = active_tab
+                        .as_deref()
+                        .and_then(|tid| pane::tab_title(&pane_widget, tid));
+                    let wd = pane::active_tab_working_directory(&pane_widget);
+                    (surface, title, wd)
+                })
+                .unwrap_or((None, None, None));
+
+            let effective_cwd = tab_cwd.or(cwd);
+            let Some(ctx) = crate::ai_usage::detect_active_agent(
+                surface_id.as_deref(),
+                workspace_id.as_deref(),
+                tab_title.as_deref(),
+                effective_cwd.as_deref(),
+            ) else {
+                state.borrow().ai_usage_badge.set_visible(false);
+                return glib::ControlFlow::Continue;
+            };
+
+            in_flight.set(true);
+            let badge_weak = state.borrow().ai_usage_badge.downgrade();
+            let in_flight_clone = in_flight.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let usage = crate::ai_usage::collect_usage_for_context(&ctx);
+                let _ = tx.send(usage);
+            });
+            glib::timeout_add_local(std::time::Duration::from_millis(80), move || {
+                match rx.try_recv() {
+                    Ok(usage) => {
+                        in_flight_clone.set(false);
+                        if let Some(badge) = badge_weak.upgrade() {
+                            for cls in [
+                                "limux-ai-usage-badge-claude",
+                                "limux-ai-usage-badge-agy",
+                                "limux-ai-usage-badge-codex",
+                                "limux-ai-usage-badge-gemini",
+                            ] {
+                                badge.remove_css_class(cls);
+                            }
+                            badge.add_css_class(usage.css_variant_class());
+                            badge.set_label(&usage.format_badge());
+                            badge.set_tooltip_text(Some(&usage.format_tooltip()));
+                            badge.set_visible(true);
+                        }
+                        glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        in_flight_clone.set(false);
+                        glib::ControlFlow::Break
+                    }
+                }
+            });
+
+            glib::ControlFlow::Continue
+        });
+    }
+
+    // 2. Smart AI tab title auto-updater (every 20 seconds when enabled).
+    {
+        let weak_state = Rc::downgrade(state);
+        let in_flight = Rc::new(Cell::new(false));
+        let last_fingerprints: Rc<RefCell<HashMap<String, u64>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        glib::timeout_add_local(std::time::Duration::from_secs(20), move || {
+            let Some(state) = weak_state.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let backend = state.borrow().config.borrow().interface.ai_tab_titles;
+            if backend == app_config::AiTabTitleBackend::Off || in_flight.get() {
+                return glib::ControlFlow::Continue;
+            }
+
+            let Some(pane_widget) = active_workspace_focused_or_leading_pane(&state) else {
+                return glib::ControlFlow::Continue;
+            };
+            let Some((tab_id, handle)) = pane::active_tab_terminal_handle(&pane_widget) else {
+                return glib::ControlFlow::Continue;
+            };
+            let Some(raw_screen) = handle.read_text(false) else {
+                return glib::ControlFlow::Continue;
+            };
+            let context = crate::ai_tab_title::extract_screen_context(&raw_screen);
+            if context.is_empty() {
+                return glib::ControlFlow::Continue;
+            }
+
+            let pane_id = pane::pane_id(&pane_widget).unwrap_or(0);
+            let surface_id = format!("{pane_id}:{tab_id}");
+            let workspace_id = state.borrow().active_workspace().map(|w| w.id.clone());
+            let tab_title = pane::tab_title(&pane_widget, &tab_id);
+            let cwd = pane::active_tab_working_directory(&pane_widget).or_else(|| {
+                state
+                    .borrow()
+                    .active_workspace()
+                    .and_then(|w| w.folder_path.clone())
+            });
+            let agent_label = crate::ai_usage::detect_active_agent(
+                Some(&surface_id),
+                workspace_id.as_deref(),
+                tab_title.as_deref(),
+                cwd.as_deref(),
+            )
+            .map(|ctx| ctx.agent.label().to_string());
+
+            let fp = crate::ai_tab_title::context_fingerprint(
+                &context,
+                cwd.as_deref(),
+                agent_label.as_deref(),
+            );
+            if last_fingerprints.borrow().get(&surface_id).copied() == Some(fp) {
+                return glib::ControlFlow::Continue;
+            }
+            last_fingerprints.borrow_mut().insert(surface_id, fp);
+
+            in_flight.set(true);
+            let pane_weak = pane_widget.downgrade();
+            let in_flight_clone = in_flight.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let title = crate::ai_tab_title::generate_tab_title(
+                    backend,
+                    &context,
+                    cwd.as_deref(),
+                    agent_label.as_deref(),
+                );
+                let _ = tx.send(title);
+            });
+            glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
+                match rx.try_recv() {
+                    Ok(title) => {
+                        in_flight_clone.set(false);
+                        if let (Some(pane), Some(title)) = (pane_weak.upgrade(), title) {
+                            pane::set_auto_tab_title_in_pane(&pane, &tab_id, &title);
+                        }
+                        glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        in_flight_clone.set(false);
+                        glib::ControlFlow::Break
+                    }
+                }
+            });
+
+            glib::ControlFlow::Continue
+        });
     }
 }
 
@@ -4137,6 +4394,20 @@ fn build_sidebar_row(
 
     let top_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     top_row.append(&notify_dot);
+    if let Some(p) = folder_path {
+        let kind = crate::project_picker::detect_project_kind(Path::new(p));
+        let badge = gtk::Label::builder()
+            .label(kind.glyph())
+            .valign(gtk::Align::Center)
+            .margin_end(6)
+            .build();
+        badge.add_css_class("limux-project-badge");
+        if let Some(cls) = kind.badge_css_class() {
+            badge.add_css_class(cls);
+        }
+        badge.set_tooltip_text(Some(&format!("{} — {}", kind.label(), p)));
+        top_row.append(&badge);
+    }
     top_row.append(&name_label);
 
     let favorite_button = gtk::Button::with_label("\u{2606}");
@@ -5472,6 +5743,7 @@ fn add_workspace_from_gui(state: &State) {
 
 /// Create a workspace in `folder_path` after its GUI hook.
 fn create_workspace_from_gui(state: &State, name: &str, folder_path: &str) {
+    crate::project_picker::record_recent_project(Path::new(folder_path));
     let context = GuiHookContext {
         workspace_name: Some(name.to_string()),
         folder: Some(folder_path.to_string()),
@@ -5492,18 +5764,31 @@ fn active_window(state: &State) -> Option<gtk::Window> {
 
 fn show_workspace_path_dialog(state: &State) {
     let dialog = gtk::Window::builder()
-        .title("Open Folder as Workspace")
+        .title("Open Project or Folder as Workspace")
         .modal(true)
-        .default_width(520)
+        .default_width(560)
+        .default_height(460)
         .build();
     if let Some(window) = active_window(state) {
         dialog.set_transient_for(Some(&window));
     }
 
-    let default_folder = dirs::home_dir()
+    let open_paths: Vec<String> = state
+        .borrow()
+        .workspaces
+        .iter()
+        .filter_map(|ws| ws.folder_path.clone())
+        .collect();
+    let all_projects = Rc::new(crate::project_picker::collect_project_entries(&open_paths));
+
+    let default_folder = all_projects
+        .first()
+        .map(|entry| entry.path.clone())
+        .or_else(dirs::home_dir)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("/"));
     let entry = gtk::Entry::builder()
+        .placeholder_text("Search projects or enter folder path...")
         .text(default_folder.to_string_lossy())
         .hexpand(true)
         .activates_default(true)
@@ -5518,7 +5803,7 @@ fn show_workspace_path_dialog(state: &State) {
 
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
+        .spacing(10)
         .margin_top(12)
         .margin_bottom(12)
         .margin_start(12)
@@ -5534,6 +5819,95 @@ fn show_workspace_path_dialog(state: &State) {
     content.append(&path_row);
     content.append(&error_label);
 
+    let project_list = gtk::ListBox::new();
+    project_list.set_selection_mode(gtk::SelectionMode::Single);
+    project_list.set_activate_on_single_click(false);
+    project_list.add_css_class("limux-project-list");
+
+    let populate_list = {
+        let project_list = project_list.clone();
+        let all_projects = all_projects.clone();
+        move |query: &str| {
+            while let Some(child) = project_list.first_child() {
+                project_list.remove(&child);
+            }
+            for project in crate::project_picker::filter_projects(&all_projects, query) {
+                let row_box = gtk::Box::builder()
+                    .orientation(gtk::Orientation::Horizontal)
+                    .spacing(10)
+                    .margin_top(2)
+                    .margin_bottom(2)
+                    .build();
+
+                let badge = gtk::Label::builder()
+                    .label(project.kind.glyph())
+                    .valign(gtk::Align::Center)
+                    .build();
+                badge.add_css_class("limux-project-badge");
+                if let Some(cls) = project.kind.badge_css_class() {
+                    badge.add_css_class(cls);
+                }
+
+                let text_box = gtk::Box::builder()
+                    .orientation(gtk::Orientation::Vertical)
+                    .spacing(1)
+                    .hexpand(true)
+                    .build();
+                let name_label = gtk::Label::builder()
+                    .label(&project.name)
+                    .xalign(0.0)
+                    .ellipsize(gtk::pango::EllipsizeMode::End)
+                    .build();
+                name_label.add_css_class("limux-project-name");
+                let path_label = gtk::Label::builder()
+                    .label(&project.display_path)
+                    .xalign(0.0)
+                    .ellipsize(gtk::pango::EllipsizeMode::End)
+                    .build();
+                path_label.add_css_class("limux-project-path");
+                text_box.append(&name_label);
+                text_box.append(&path_label);
+
+                row_box.append(&badge);
+                row_box.append(&text_box);
+
+                let tag_text = if project.is_open {
+                    "Open"
+                } else if project.is_recent {
+                    "Recent"
+                } else {
+                    project.kind.label()
+                };
+                let tag = gtk::Label::builder()
+                    .label(tag_text)
+                    .valign(gtk::Align::Center)
+                    .build();
+                tag.add_css_class("limux-project-tag");
+                if project.is_recent {
+                    tag.add_css_class("limux-project-tag-recent");
+                }
+                row_box.append(&tag);
+
+                let row = gtk::ListBoxRow::new();
+                row.set_widget_name(&project.path.to_string_lossy());
+                row.set_child(Some(&row_box));
+                project_list.append(&row);
+            }
+        }
+    };
+    populate_list("");
+
+    let list_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .vexpand(true)
+        .min_content_height(240)
+        .child(&project_list)
+        .build();
+    if !all_projects.is_empty() {
+        content.append(&list_scroll);
+    }
+
     let buttons = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .halign(gtk::Align::End)
@@ -5546,6 +5920,45 @@ fn show_workspace_path_dialog(state: &State) {
     buttons.append(&open_button);
     content.append(&buttons);
     dialog.set_child(Some(&content));
+
+    {
+        let entry_for_select = entry.clone();
+        project_list.connect_row_selected(move |_, row| {
+            if let Some(row) = row {
+                let path = row.widget_name();
+                if !path.is_empty() {
+                    entry_for_select.set_text(&path);
+                    entry_for_select.set_position(-1);
+                }
+            }
+        });
+    }
+    {
+        let state_for_activate = state.clone();
+        let dialog_for_activate = dialog.clone();
+        project_list.connect_row_activated(move |_, row| {
+            let path = row.widget_name();
+            if let Ok(selection) = validate_workspace_folder_input(&path) {
+                create_workspace_from_gui(
+                    &state_for_activate,
+                    &selection.name,
+                    selection.path_text.as_str(),
+                );
+                dialog_for_activate.close();
+            }
+        });
+    }
+    {
+        let populate_for_filter = populate_list;
+        entry.connect_changed(move |entry| {
+            let text = entry.text();
+            if text.contains('/') || text.starts_with('~') {
+                populate_for_filter("");
+            } else {
+                populate_for_filter(&text);
+            }
+        });
+    }
 
     entry.grab_focus();
     entry.select_region(0, -1);
