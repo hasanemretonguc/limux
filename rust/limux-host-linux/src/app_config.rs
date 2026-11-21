@@ -210,6 +210,7 @@ pub struct AppearanceConfig {
     pub color_scheme: ColorScheme,
     pub ghostty_color_scheme: ColorScheme,
     pub ui_scale: UiScale,
+    pub ui_font_family: Option<String>,
     pub show_workspace_path: bool,
     pub unread_color: UnreadColor,
 }
@@ -221,6 +222,7 @@ impl Default for AppearanceConfig {
             color_scheme: ColorScheme::default(),
             ghostty_color_scheme: ColorScheme::default(),
             ui_scale: UiScale::default(),
+            ui_font_family: None,
             show_workspace_path: true,
             unread_color: UnreadColor::default(),
         }
@@ -595,6 +597,13 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(UiScale::new)
         .unwrap_or_default();
 
+    let ui_font_family = appearance
+        .and_then(|appearance| appearance.get("ui_font_family"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+
     let show_workspace_path = appearance
         .and_then(|appearance| appearance.get("show_workspace_path"))
         .and_then(Value::as_bool)
@@ -702,6 +711,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             color_scheme,
             ghostty_color_scheme,
             ui_scale,
+            ui_font_family,
             show_workspace_path,
             unread_color,
         },
@@ -761,6 +771,15 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
             "ui_scale".to_string(),
             json!(config.appearance.ui_scale.get()),
         );
+    }
+    if let Some(font) = config
+        .appearance
+        .ui_font_family
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        appearance.insert("ui_font_family".to_string(), json!(font));
     }
     if config.appearance.unread_color != UnreadColor::default() {
         appearance.insert(

@@ -110,6 +110,7 @@ pub(crate) struct AppState {
     top_bar_visible: bool,
     config: Rc<RefCell<app_config::AppConfig>>,
     css_provider: gtk::CssProvider,
+    scale_css_provider: gtk::CssProvider,
     system_prefers_dark: Rc<Cell<Option<bool>>>,
     /// Kept in `sidebar.workspace_order()`; see `sidebar_groups::sync_sidebar`.
     workspaces: Vec<Workspace>,
@@ -1764,10 +1765,13 @@ fn app_css(background_opacity: f64, config: &app_config::AppConfig) -> String {
 fn reload_app_css(state: &State, config: &app_config::AppConfig) {
     let background_opacity =
         sanitize_background_opacity(crate::terminal::ghostty_background_opacity());
-    state
-        .borrow()
-        .css_provider
+    let s = state.borrow();
+    s.css_provider
         .load_from_data(&app_css(background_opacity, config));
+    s.scale_css_provider
+        .load_from_data(&crate::settings_editor::ui_scale_and_font_override_css(
+            config,
+        ));
 }
 
 // ---------------------------------------------------------------------------
@@ -1810,6 +1814,15 @@ pub fn build_window(app: &adw::Application) {
         &display,
         &swatch_provider,
         gtk::STYLE_PROVIDER_PRIORITY_USER + 1,
+    );
+    let scale_css_provider = gtk::CssProvider::new();
+    scale_css_provider.load_from_data(&crate::settings_editor::ui_scale_and_font_override_css(
+        &config.borrow(),
+    ));
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &scale_css_provider,
+        gtk::STYLE_PROVIDER_PRIORITY_USER + 2,
     );
 
     let style_manager = adw::StyleManager::default();
@@ -2105,6 +2118,7 @@ pub fn build_window(app: &adw::Application) {
         top_bar_visible: true,
         config,
         css_provider: provider.clone(),
+        scale_css_provider: scale_css_provider.clone(),
         system_prefers_dark: system_prefers_dark.clone(),
         workspaces: Vec::new(),
         active_idx: 0,
@@ -3094,10 +3108,18 @@ fn handle_config_change(
     let system_prefers_dark = state.borrow().system_prefers_dark.get();
     apply_appearance(&style_manager, system_prefers_dark, &updated.appearance);
     if updated.appearance.ui_scale != previous.appearance.ui_scale
+        || updated.appearance.ui_font_family != previous.appearance.ui_font_family
         || updated.appearance.unread_color != previous.appearance.unread_color
         || updated.appearance.ui_theme != previous.appearance.ui_theme
     {
         reload_app_css(state, updated);
+    }
+    if updated.font_size != previous.font_size {
+        broadcast_font_size(
+            updated
+                .font_size
+                .unwrap_or_else(crate::terminal::default_font_size),
+        );
     }
     if updated.appearance.show_workspace_path != previous.appearance.show_workspace_path {
         sync_workspace_path_visibility(state, updated.appearance.show_workspace_path);
@@ -3113,10 +3135,18 @@ fn handle_config_change(
         state.borrow().config.borrow_mut().clone_from(previous);
         apply_appearance(&style_manager, system_prefers_dark, &previous.appearance);
         if updated.appearance.ui_scale != previous.appearance.ui_scale
+            || updated.appearance.ui_font_family != previous.appearance.ui_font_family
             || updated.appearance.unread_color != previous.appearance.unread_color
             || updated.appearance.ui_theme != previous.appearance.ui_theme
         {
             reload_app_css(state, previous);
+        }
+        if updated.font_size != previous.font_size {
+            broadcast_font_size(
+                previous
+                    .font_size
+                    .unwrap_or_else(crate::terminal::default_font_size),
+            );
         }
         if updated.appearance.show_workspace_path != previous.appearance.show_workspace_path {
             sync_workspace_path_visibility(state, previous.appearance.show_workspace_path);
@@ -6125,8 +6155,34 @@ fn workspace_folder_path_from_input(
     }
 }
 
+fn deduplicate_workspace_name(base_name: &str, existing_names: &[&str]) -> String {
+    let base = base_name.trim();
+    if base.is_empty()
+        || !existing_names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(base))
+    {
+        return base_name.to_string();
+    }
+    let prefix = format!("{base} #");
+    let mut max_num = 1u32;
+    for existing in existing_names {
+        if existing.len() > prefix.len() && existing[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+            if let Ok(num) = existing[prefix.len()..].trim().parse::<u32>() {
+                max_num = max_num.max(num);
+            }
+        }
+    }
+    format!("{base} #{}", max_num + 1)
+}
+
 fn create_workspace_with_folder(state: &State, name: &str, folder_path: &str) {
-    let workspace = workspace_state_with_folder(name, folder_path);
+    let unique_name = {
+        let s = state.borrow();
+        let existing: Vec<&str> = s.workspaces.iter().map(|w| w.name.as_str()).collect();
+        deduplicate_workspace_name(name, &existing)
+    };
+    let workspace = workspace_state_with_folder(&unique_name, folder_path);
     add_workspace_from_state(state, &workspace);
     request_session_save(state);
 }

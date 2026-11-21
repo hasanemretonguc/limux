@@ -69,7 +69,7 @@ impl AiToolUsage {
     pub fn short_agent_name(&self) -> &'static str {
         match self.agent {
             AgentKind::Claude => "Claude",
-            AgentKind::Agy => "Agy",
+            AgentKind::Agy => "Gemini",
             AgentKind::Codex => "Codex",
             AgentKind::Gemini => "Gemini",
             AgentKind::OpenCode => "OpenCode",
@@ -91,7 +91,11 @@ impl AiToolUsage {
     }
 
     pub fn format_tooltip(&self) -> String {
-        let mut lines = vec![format!("Active AI Tool: {}", self.agent.label())];
+        let tool_name = match self.agent {
+            AgentKind::Agy => "Gemini (Antigravity)",
+            other => other.label(),
+        };
+        let mut lines = vec![format!("Active AI Tool: {tool_name}")];
         if let Some(model) = self.model.as_deref().filter(|m| !m.is_empty()) {
             lines.push(format!("Model: {model}"));
         }

@@ -98,7 +98,79 @@ const UI_SCALE_DESCRIPTORS: &[UiScaleDescriptor] = &[
         property: "-gtk-icon-size",
         base_size: 12.0,
     },
+    UiScaleDescriptor {
+        selector: ".limux-ai-usage-badge",
+        property: "font-size",
+        base_size: 11.0,
+    },
+    UiScaleDescriptor {
+        selector: ".limux-project-badge, .limux-project-tag",
+        property: "font-size",
+        base_size: 10.0,
+    },
+    UiScaleDescriptor {
+        selector: ".limux-project-name",
+        property: "font-size",
+        base_size: 13.0,
+    },
+    UiScaleDescriptor {
+        selector: ".limux-project-path",
+        property: "font-size",
+        base_size: 11.0,
+    },
+    UiScaleDescriptor {
+        selector: ".limux-indicator-pill",
+        property: "font-size",
+        base_size: 12.0,
+    },
+    UiScaleDescriptor {
+        selector: ".limux-sidebar-btn",
+        property: "font-size",
+        base_size: 16.0,
+    },
 ];
+
+pub fn sanitize_css_font_family(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !matches!(c, '"' | '\'' | ';' | '{' | '}' | '\n' | '\r' | '\\'))
+        .collect();
+    let trimmed = cleaned.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// High-priority CSS for interface scale and custom UI font family so user
+/// GTK overrides (e.g. `~/.config/gtk-4.0/gtk.css`) cannot block Limux's
+/// in-app scale and font settings.
+pub fn ui_scale_and_font_override_css(config: &AppConfig) -> String {
+    let scale = config.appearance.ui_scale.get();
+    let mut rules = Vec::new();
+    if let Some(font) = config
+        .appearance
+        .ui_font_family
+        .as_deref()
+        .and_then(sanitize_css_font_family)
+    {
+        rules.push(format!(
+            "window, window * {{ font-family: \"{font}\", sans-serif; }}"
+        ));
+    }
+    if !config.appearance.ui_scale.is_default() {
+        rules.push(format!(
+            ".limux-settings-window, .limux-sidebar, .limux-pane-header, .limux-top-bar {{ font-size: {:.3}px; }}",
+            12.0 * scale
+        ));
+    }
+    for descriptor in UI_SCALE_DESCRIPTORS {
+        rules.push(format!(
+            "{} {{ {}: {:.3}px; }}",
+            descriptor.selector,
+            descriptor.property,
+            descriptor.base_size * scale
+        ));
+    }
+    rules.join("\n")
+}
 
 pub fn ui_scale_css(config: &AppConfig) -> String {
     let scale = config.appearance.ui_scale.get();
@@ -650,6 +722,66 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     scale_row.set_activatable_widget(Some(&scale_spin));
     group.add(&scale_row);
 
+    let ui_font_row = adw::ActionRow::builder()
+        .title("Interface font")
+        .subtitle("Custom font family for Limux UI (leave blank for system default)")
+        .build();
+    ui_font_row.set_title_lines(1);
+    ui_font_row.set_subtitle_lines(2);
+    let ui_font_entry = gtk::Entry::builder()
+        .placeholder_text("System default")
+        .text(
+            input
+                .config
+                .borrow()
+                .appearance
+                .ui_font_family
+                .as_deref()
+                .unwrap_or(""),
+        )
+        .valign(gtk::Align::Center)
+        .width_chars(20)
+        .build();
+    let ui_font_reset_button = gtk::Button::builder()
+        .label("Default")
+        .tooltip_text("Reset interface font")
+        .valign(gtk::Align::Center)
+        .build();
+    ui_font_row.add_suffix(&ui_font_entry);
+    ui_font_row.add_suffix(&ui_font_reset_button);
+    ui_font_row.set_activatable_widget(Some(&ui_font_entry));
+    group.add(&ui_font_row);
+
+    let term_font_size_row = adw::ActionRow::builder()
+        .title("Terminal font size")
+        .subtitle("Font size in points for all terminal surfaces")
+        .build();
+    term_font_size_row.set_title_lines(1);
+    term_font_size_row.set_subtitle_lines(2);
+    let initial_term_font = input
+        .config
+        .borrow()
+        .font_size
+        .unwrap_or_else(crate::terminal::default_font_size);
+    let term_font_adjustment =
+        gtk::Adjustment::new(f64::from(initial_term_font), 6.0, 48.0, 0.5, 2.0, 0.0);
+    let term_font_spin = gtk::SpinButton::builder()
+        .adjustment(&term_font_adjustment)
+        .digits(1)
+        .numeric(true)
+        .valign(gtk::Align::Center)
+        .width_chars(4)
+        .build();
+    let term_font_reset_button = gtk::Button::builder()
+        .label("Default")
+        .tooltip_text("Reset terminal font size to Ghostty default")
+        .valign(gtk::Align::Center)
+        .build();
+    term_font_size_row.add_suffix(&term_font_spin);
+    term_font_size_row.add_suffix(&term_font_reset_button);
+    term_font_size_row.set_activatable_widget(Some(&term_font_spin));
+    group.add(&term_font_size_row);
+
     let top_bar_row = adw::ActionRow::builder()
         .title("Top bar")
         .subtitle("Show a top bar with workspace indicators. When off, the controls move into the sidebar header. If the sidebar is also hidden, its toggle remains on the leading pane.")
@@ -770,6 +902,60 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
 
     page.add(&group);
 
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        ui_font_entry.connect_changed(move |entry| {
+            let text = entry.text();
+            let font = text.trim();
+            let next = (!font.is_empty()).then(|| font.to_string());
+            if next == config.borrow().appearance.ui_font_family {
+                return;
+            }
+            apply_config_change(&config, &*on_changed, move |c| {
+                c.appearance.ui_font_family = next;
+            });
+        });
+    }
+    {
+        let ui_font_entry = ui_font_entry.clone();
+        ui_font_reset_button.connect_clicked(move |_| {
+            ui_font_entry.set_text("");
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        let syncing = Rc::new(Cell::new(false));
+        let syncing_for_spin = syncing.clone();
+        term_font_spin.connect_value_changed(move |spin| {
+            if syncing_for_spin.get() {
+                return;
+            }
+            let size = (spin.value() as f32).clamp(6.0, 48.0);
+            if config
+                .borrow()
+                .font_size
+                .is_some_and(|existing| (existing - size).abs() < 0.05)
+            {
+                return;
+            }
+            apply_config_change(&config, &*on_changed, move |c| {
+                c.font_size = Some(size);
+            });
+        });
+        let config_for_reset = input.config.clone();
+        let on_changed_for_reset = input.on_config_changed.clone();
+        let term_font_spin_for_reset = term_font_spin.clone();
+        term_font_reset_button.connect_clicked(move |_| {
+            syncing.set(true);
+            term_font_spin_for_reset.set_value(f64::from(crate::terminal::default_font_size()));
+            syncing.set(false);
+            apply_config_change(&config_for_reset, &*on_changed_for_reset, |c| {
+                c.font_size = None;
+            });
+        });
+    }
     {
         let config = input.config.clone();
         let on_changed = input.on_config_changed.clone();
