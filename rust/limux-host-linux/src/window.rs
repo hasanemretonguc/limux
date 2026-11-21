@@ -126,6 +126,9 @@ pub(crate) struct AppState {
     last_pane_by_workspace: HashMap<String, u32>,
     shortcuts: Rc<ResolvedShortcutConfig>,
     stack: gtk::Stack,
+    stage_host: gtk::Box,
+    stage_tree: Option<crate::workspace_stage::StageNode>,
+    suppress_stage_reset_on_select: Cell<bool>,
     sidebar_list: gtk::ListBox,
     sidebar_shell: gtk::Box,
     sidebar_handle: gtk::Box,
@@ -1746,7 +1749,7 @@ fn app_css(background_opacity: f64, config: &app_config::AppConfig) -> String {
             (CONTENT_BACKGROUND_RGB, String::new())
         };
     format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         build_window_css_with_bg(background_opacity, content_bg_rgb),
         pane::PANE_CSS,
         crate::terminal::CLIPBOARD_TOAST_CSS,
@@ -1758,6 +1761,7 @@ fn app_css(background_opacity: f64, config: &app_config::AppConfig) -> String {
         sidebar_groups::workspace_group_css(),
         crate::project_picker::PROJECT_PICKER_CSS,
         crate::ai_usage::AI_USAGE_CSS,
+        crate::workspace_stage::WORKSPACE_STAGE_CSS,
         omarchy_css,
     )
 }
@@ -2092,7 +2096,14 @@ pub fn build_window(app: &adw::Application) {
     ssh_button.set_tooltip_text(Some("Open an SSH connection in a new workspace"));
     sidebar.append(&ssh_button);
 
-    let (main_split, sidebar_shell, sidebar_handle) = build_sidebar_split(&sidebar, &stack);
+    let stage_host = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    stage_host.append(&stack);
+
+    let (main_split, sidebar_shell, sidebar_handle) = build_sidebar_split(&sidebar, &stage_host);
 
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     vbox.append(&header);
@@ -2131,6 +2142,9 @@ pub fn build_window(app: &adw::Application) {
         last_pane_by_workspace: HashMap::new(),
         shortcuts,
         stack: stack.clone(),
+        stage_host: stage_host.clone(),
+        stage_tree: None,
+        suppress_stage_reset_on_select: Cell::new(false),
         indicator_box: indicator_box.clone(),
         indicator_scroll,
         sidebar_list: sidebar_list.clone(),
@@ -2526,7 +2540,10 @@ fn build_window_css_with_bg(background_opacity: f64, (r, g, b): (u8, u8, u8)) ->
     )
 }
 
-fn build_sidebar_split(sidebar: &gtk::Box, stack: &gtk::Stack) -> (gtk::Box, gtk::Box, gtk::Box) {
+fn build_sidebar_split(
+    sidebar: &gtk::Box,
+    content_host: &impl IsA<gtk::Widget>,
+) -> (gtk::Box, gtk::Box, gtk::Box) {
     let sidebar_shell = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .hexpand(false)
@@ -2551,7 +2568,7 @@ fn build_sidebar_split(sidebar: &gtk::Box, stack: &gtk::Stack) -> (gtk::Box, gtk
         .build();
     main_split.append(&sidebar_shell);
     main_split.append(&sidebar_handle);
-    main_split.append(stack);
+    main_split.append(content_host);
 
     (main_split, sidebar_shell, sidebar_handle)
 }
@@ -4751,6 +4768,45 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
     delete_btn.add_css_class("flat");
     delete_btn.add_css_class("destructive-action");
 
+    let split_dir_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .halign(gtk::Align::Center)
+        .margin_bottom(2)
+        .build();
+    let split_left_btn = gtk::Button::with_label("←");
+    split_left_btn.set_tooltip_text(Some("Open to the left of current workspace"));
+    split_left_btn.add_css_class("flat");
+    split_left_btn.add_css_class("limux-stage-dir-btn");
+    let split_right_btn = gtk::Button::with_label("→");
+    split_right_btn.set_tooltip_text(Some("Open to the right of current workspace"));
+    split_right_btn.add_css_class("flat");
+    split_right_btn.add_css_class("limux-stage-dir-btn");
+    let split_up_btn = gtk::Button::with_label("↑");
+    split_up_btn.set_tooltip_text(Some("Open above current workspace"));
+    split_up_btn.add_css_class("flat");
+    split_up_btn.add_css_class("limux-stage-dir-btn");
+    let split_down_btn = gtk::Button::with_label("↓");
+    split_down_btn.set_tooltip_text(Some("Open below current workspace"));
+    split_down_btn.add_css_class("flat");
+    split_down_btn.add_css_class("limux-stage-dir-btn");
+    split_dir_row.append(&split_left_btn);
+    split_dir_row.append(&split_right_btn);
+    split_dir_row.append(&split_up_btn);
+    split_dir_row.append(&split_down_btn);
+
+    let is_in_multi_stage = state
+        .borrow()
+        .stage_tree
+        .as_ref()
+        .is_some_and(|tree| tree.is_multi() && tree.contains(workspace_id));
+    let detach_stage_btn = gtk::Button::with_label("Detach from Split View");
+    detach_stage_btn.add_css_class("flat");
+
+    menu_box.append(&split_dir_row);
+    if is_in_multi_stage {
+        menu_box.append(&detach_stage_btn);
+    }
     menu_box.append(&new_tab_btn);
     menu_box.append(&unread_btn);
     menu_box.append(&rename_btn);
@@ -4774,6 +4830,43 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
 
     let popover = sidebar_menu_popover(state, row, &menu_box);
     sidebar_groups::append_workspace_group_items(state, workspace_id, &group_box, &popover);
+
+    for (btn, dir) in [
+        (
+            &split_left_btn,
+            crate::workspace_stage::StageDirection::Left,
+        ),
+        (
+            &split_right_btn,
+            crate::workspace_stage::StageDirection::Right,
+        ),
+        (&split_up_btn, crate::workspace_stage::StageDirection::Up),
+        (
+            &split_down_btn,
+            crate::workspace_stage::StageDirection::Down,
+        ),
+    ] {
+        let state = state.clone();
+        let ws_id = workspace_id.to_string();
+        let pop = popover.downgrade();
+        btn.connect_clicked(move |_| {
+            if let Some(pop) = pop.upgrade() {
+                pop.popdown();
+            }
+            open_workspace_in_stage(&state, &ws_id, dir);
+        });
+    }
+    {
+        let state = state.clone();
+        let ws_id = workspace_id.to_string();
+        let pop = popover.downgrade();
+        detach_stage_btn.connect_clicked(move |_| {
+            if let Some(pop) = pop.upgrade() {
+                pop.popdown();
+            }
+            detach_workspace_from_stage(&state, &ws_id);
+        });
+    }
 
     for (color, button) in swatches {
         let state = state.clone();
@@ -5545,13 +5638,42 @@ fn install_workspace_row_interactions(
     }
     row.add_controller(right_click);
 
-    // Double-left-click anywhere on the row starts inline rename.
+    // Middle-click on a sidebar row opens that workspace to the right in split view.
+    let middle_click = gtk::GestureClick::new();
+    middle_click.set_button(2);
+    {
+        let state = state.clone();
+        let workspace_id = workspace_id.to_string();
+        middle_click.connect_pressed(move |gesture, _, _, _| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            open_workspace_in_stage(
+                &state,
+                &workspace_id,
+                crate::workspace_stage::StageDirection::Right,
+            );
+        });
+    }
+    row.add_controller(middle_click);
+
+    // Ctrl+Left-click opens side-by-side; double-left-click starts inline rename.
     let double_click = gtk::GestureClick::new();
     double_click.set_button(1);
     {
         let state = state.clone();
         let workspace_id = workspace_id.to_string();
         double_click.connect_pressed(move |gesture, n_press, _, _| {
+            let ctrl_held = gesture
+                .current_event_state()
+                .contains(gtk::gdk::ModifierType::CONTROL_MASK);
+            if n_press == 1 && ctrl_held {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                open_workspace_in_stage(
+                    &state,
+                    &workspace_id,
+                    crate::workspace_stage::StageDirection::Right,
+                );
+                return;
+            }
             if n_press == 2 {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 begin_workspace_inline_rename(&state, &workspace_id);
@@ -8357,6 +8479,10 @@ fn close_workspace_by_id_internal(
 
     let ws = s.workspaces.remove(idx);
     s.sidebar.remove_workspace(id);
+    if let Some(tree) = s.stage_tree.take() {
+        let updated = tree.remove_workspace(id);
+        s.stage_tree = updated.filter(|node| node.is_multi());
+    }
     if s.last_workspace_id.as_deref() == Some(id) {
         s.last_workspace_id = None;
     }
@@ -8514,14 +8640,21 @@ fn switch_workspace(state: &State, idx: usize) {
 }
 
 fn switch_workspace_with_focus(state: &State, idx: usize, focus_entrypoint: bool) {
-    let active_workspace_id = {
+    let (same_active, should_exit_stage) = {
         let s = state.borrow();
         if idx >= s.workspaces.len() {
             return;
         }
-        (idx == s.active_idx).then(|| s.workspaces[idx].id.clone())
+        let same = (idx == s.active_idx).then(|| s.workspaces[idx].id.clone());
+        let exit_stage = !s.suppress_stage_reset_on_select.get()
+            && s.stage_tree.as_ref().is_some_and(|tree| tree.is_multi());
+        (same, exit_stage)
     };
-    if let Some(workspace_id) = active_workspace_id {
+    if should_exit_stage {
+        state.borrow_mut().stage_tree = None;
+        rebuild_workspace_stage(state);
+    }
+    if let Some(workspace_id) = same_active {
         clear_visible_tab_unread(state, &workspace_id);
         return;
     }
@@ -8560,6 +8693,304 @@ fn switch_workspace_with_focus(state: &State, idx: usize, focus_entrypoint: bool
     // move it to the new active workspace's leading pane.
     apply_top_bar_mode(state);
     request_session_save(state);
+}
+
+fn open_workspace_in_stage(
+    state: &State,
+    workspace_id: &str,
+    direction: crate::workspace_stage::StageDirection,
+) {
+    let target_id = {
+        let s = state.borrow();
+        if !s.workspaces.iter().any(|w| w.id == workspace_id) {
+            return;
+        }
+        s.active_workspace()
+            .map(|w| w.id.clone())
+            .unwrap_or_else(|| workspace_id.to_string())
+    };
+    if target_id == workspace_id {
+        return;
+    }
+
+    {
+        let mut s = state.borrow_mut();
+        let current_tree = s
+            .stage_tree
+            .take()
+            .unwrap_or_else(|| crate::workspace_stage::StageNode::single(&target_id));
+        let next_tree = current_tree.split_workspace(&target_id, workspace_id, direction);
+        s.stage_tree = next_tree.is_multi().then_some(next_tree);
+    }
+
+    rebuild_workspace_stage(state);
+    focus_staged_workspace(state, workspace_id);
+}
+
+fn detach_workspace_from_stage(state: &State, workspace_id: &str) {
+    let fallback_active = {
+        let mut s = state.borrow_mut();
+        let Some(tree) = s.stage_tree.take() else {
+            return;
+        };
+        let remaining = tree.remove_workspace(workspace_id);
+        let fallback = remaining
+            .as_ref()
+            .and_then(|node| node.workspace_ids().into_iter().next());
+        s.stage_tree = remaining.filter(|node| node.is_multi());
+        fallback
+    };
+
+    rebuild_workspace_stage(state);
+    if let Some(target_id) = fallback_active {
+        focus_staged_workspace(state, &target_id);
+    }
+}
+
+fn focus_staged_workspace(state: &State, workspace_id: &str) {
+    let (idx, row, sidebar_list, focus_root, is_multi) = {
+        let mut s = state.borrow_mut();
+        let Some(idx) = s.workspaces.iter().position(|w| w.id == workspace_id) else {
+            return;
+        };
+        s.active_idx = idx;
+        sync_indicator_active_state(&s);
+        let row = s.workspaces[idx].sidebar_row.clone();
+        let sidebar_list = s.sidebar_list.clone();
+        let focus_root = s.workspaces[idx].root.clone();
+        let is_multi = s.stage_tree.as_ref().is_some_and(|t| t.is_multi());
+        (idx, row, sidebar_list, focus_root, is_multi)
+    };
+
+    if is_multi {
+        state.borrow().suppress_stage_reset_on_select.set(true);
+        sidebar_list.select_row(Some(&row));
+        state.borrow().suppress_stage_reset_on_select.set(false);
+        update_stage_slot_focus_classes(state, workspace_id);
+        clear_visible_tab_unread(state, workspace_id);
+        glib::idle_add_local_once(move || {
+            focus_workspace_entrypoint(&focus_root);
+        });
+        apply_top_bar_mode(state);
+    } else {
+        switch_workspace(state, idx);
+        sidebar_list.select_row(Some(&row));
+    }
+}
+
+fn update_stage_slot_focus_classes(state: &State, active_ws_id: &str) {
+    let stage_host = state.borrow().stage_host.clone();
+    fn visit(widget: &gtk::Widget, active_ws_id: &str) {
+        if widget.has_css_class("limux-stage-slot") {
+            if widget.widget_name().as_str() == active_ws_id {
+                widget.add_css_class("limux-stage-slot-focused");
+            } else {
+                widget.remove_css_class("limux-stage-slot-focused");
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            visit(&c, active_ws_id);
+            child = c.next_sibling();
+        }
+    }
+    visit(stage_host.upcast_ref(), active_ws_id);
+}
+
+fn rebuild_workspace_stage(state: &State) {
+    let (stage_host, stack, tree, active_id) = {
+        let s = state.borrow();
+        let active_id = s
+            .active_workspace()
+            .map(|w| w.id.clone())
+            .unwrap_or_default();
+        (
+            s.stage_host.clone(),
+            s.stack.clone(),
+            s.stage_tree.clone(),
+            active_id,
+        )
+    };
+
+    // Detach every workspace root cleanly without destroying any terminal surface.
+    let all_workspaces: Vec<(String, gtk::Widget, gtk::ListBoxRow)> = {
+        let s = state.borrow();
+        s.workspaces
+            .iter()
+            .map(|w| (w.id.clone(), w.root.clone(), w.sidebar_row.clone()))
+            .collect()
+    };
+
+    for (_, _, row) in &all_workspaces {
+        row.remove_css_class("limux-sidebar-row-staged");
+    }
+
+    // Remove previous stage container children (keeping stack alive).
+    while let Some(child) = stage_host.first_child() {
+        stage_host.remove(&child);
+    }
+
+    let Some(tree) = tree.filter(|t| t.is_multi()) else {
+        // Single-workspace mode: restore every workspace root into `stack`.
+        for (ws_id, root, _) in &all_workspaces {
+            let stack_name = format!("ws-{ws_id}");
+            if root.parent().as_ref() != Some(stack.upcast_ref::<gtk::Widget>()) {
+                detach(root);
+                stack.add_named(root, Some(&stack_name));
+            }
+        }
+        stage_host.append(&stack);
+        if !active_id.is_empty() {
+            stack.set_visible_child_name(&format!("ws-{active_id}"));
+        }
+        apply_top_bar_mode(state);
+        return;
+    };
+
+    let staged_ids = tree.workspace_ids();
+    for (ws_id, root, row) in &all_workspaces {
+        if staged_ids.iter().any(|id| id == ws_id) {
+            detach(root);
+            row.add_css_class("limux-sidebar-row-staged");
+        } else {
+            let stack_name = format!("ws-{ws_id}");
+            if root.parent().as_ref() != Some(stack.upcast_ref::<gtk::Widget>()) {
+                detach(root);
+                stack.add_named(root, Some(&stack_name));
+            }
+        }
+    }
+
+    if let Some(widget) = build_stage_widget(state, &tree, &active_id) {
+        stage_host.append(&widget);
+    } else {
+        stage_host.append(&stack);
+    }
+    apply_top_bar_mode(state);
+}
+
+fn build_stage_widget(
+    state: &State,
+    node: &crate::workspace_stage::StageNode,
+    active_ws_id: &str,
+) -> Option<gtk::Widget> {
+    match node {
+        crate::workspace_stage::StageNode::Leaf { workspace_id } => {
+            let (name, folder_path, root) = {
+                let s = state.borrow();
+                let ws = s.workspaces.iter().find(|w| w.id == *workspace_id)?;
+                (ws.name.clone(), ws.folder_path.clone(), ws.root.clone())
+            };
+
+            let slot = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .hexpand(true)
+                .vexpand(true)
+                .build();
+            slot.set_widget_name(workspace_id);
+            slot.add_css_class("limux-stage-slot");
+            if workspace_id == active_ws_id {
+                slot.add_css_class("limux-stage-slot-focused");
+            }
+
+            let header = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(6)
+                .build();
+            header.add_css_class("limux-stage-header");
+
+            if let Some(p) = folder_path.as_deref() {
+                let kind = crate::project_picker::detect_project_kind(Path::new(p));
+                let badge = gtk::Label::builder()
+                    .label(kind.glyph())
+                    .valign(gtk::Align::Center)
+                    .build();
+                badge.add_css_class("limux-project-badge");
+                if let Some(cls) = kind.badge_css_class() {
+                    badge.add_css_class(cls);
+                }
+                header.append(&badge);
+            }
+
+            let title = gtk::Label::builder()
+                .label(&name)
+                .xalign(0.0)
+                .hexpand(true)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .build();
+            title.add_css_class("limux-stage-header-title");
+            header.append(&title);
+
+            let detach_btn = gtk::Button::with_label("⊟");
+            detach_btn.add_css_class("flat");
+            detach_btn.add_css_class("limux-stage-detach-btn");
+            detach_btn.set_focus_on_click(false);
+            detach_btn.set_tooltip_text(Some("Detach from split view (keeps workspace open)"));
+            {
+                let state = state.clone();
+                let ws_id = workspace_id.clone();
+                detach_btn.connect_clicked(move |_| {
+                    detach_workspace_from_stage(&state, &ws_id);
+                });
+            }
+            header.append(&detach_btn);
+
+            slot.append(&header);
+            slot.append(&root);
+
+            let click = gtk::GestureClick::new();
+            click.set_propagation_phase(gtk::PropagationPhase::Capture);
+            {
+                let state = state.clone();
+                let ws_id = workspace_id.clone();
+                click.connect_pressed(move |_, _, _, _| {
+                    let already_active = state
+                        .borrow()
+                        .active_workspace()
+                        .is_some_and(|w| w.id == ws_id);
+                    if !already_active {
+                        focus_staged_workspace(&state, &ws_id);
+                    }
+                });
+            }
+            slot.add_controller(click);
+
+            Some(slot.upcast())
+        }
+        crate::workspace_stage::StageNode::Split {
+            orientation,
+            first,
+            second,
+        } => {
+            let start_widget = build_stage_widget(state, first, active_ws_id);
+            let end_widget = build_stage_widget(state, second, active_ws_id);
+            match (start_widget, end_widget) {
+                (Some(a), Some(b)) => {
+                    let gtk_orient = match orientation {
+                        crate::workspace_stage::StageOrientation::Horizontal => {
+                            gtk::Orientation::Horizontal
+                        }
+                        crate::workspace_stage::StageOrientation::Vertical => {
+                            gtk::Orientation::Vertical
+                        }
+                    };
+                    let paned = gtk::Paned::new(gtk_orient);
+                    paned.set_hexpand(true);
+                    paned.set_vexpand(true);
+                    paned.set_wide_handle(false);
+                    paned.set_resize_start_child(true);
+                    paned.set_resize_end_child(true);
+                    paned.set_shrink_start_child(false);
+                    paned.set_shrink_end_child(false);
+                    paned.set_start_child(Some(&a));
+                    paned.set_end_child(Some(&b));
+                    Some(paned.upcast())
+                }
+                (Some(only), None) | (None, Some(only)) => Some(only),
+                (None, None) => None,
+            }
+        }
+    }
 }
 
 fn cycle_workspace(state: &State, direction: i32) {

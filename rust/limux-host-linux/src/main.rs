@@ -28,6 +28,7 @@ mod terminal;
 mod window;
 mod workspace_color;
 mod workspace_group;
+mod workspace_stage;
 mod x11_cursor_errors;
 
 use adw::prelude::*;
