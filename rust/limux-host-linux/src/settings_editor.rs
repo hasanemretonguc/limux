@@ -139,6 +139,93 @@ pub fn sanitize_css_font_family(raw: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+fn collect_system_font_families(widget: &impl IsA<gtk::Widget>) -> Vec<String> {
+    let mut families: Vec<String> = widget
+        .pango_context()
+        .list_families()
+        .into_iter()
+        .map(|family| family.name().to_string())
+        .filter(|name| !name.trim().is_empty())
+        .collect();
+    families.sort_by_key(|a| a.to_ascii_lowercase());
+    families.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    families
+}
+
+fn searchable_font_dropdown(options: &[&str]) -> gtk::DropDown {
+    let dropdown = gtk::DropDown::from_strings(options);
+    dropdown.set_enable_search(true);
+    let expr = gtk::PropertyExpression::new(
+        gtk::StringObject::static_type(),
+        gtk::Expression::NONE,
+        "string",
+    );
+    dropdown.set_expression(Some(&expr));
+    dropdown.set_valign(gtk::Align::Center);
+    dropdown
+}
+
+fn ghostty_config_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("ghostty/config"))
+}
+
+fn read_ghostty_font_family() -> Option<String> {
+    let path = ghostty_config_path()?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    let raw = crate::ghostty_config::read_ghostty_value(&contents, "font-family")?;
+    let trimmed = raw.trim().trim_matches(['"', '\'']).trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn detect_omarchy_font_family() -> Option<String> {
+    if let Ok(output) = std::process::Command::new("omarchy-font-current").output() {
+        if output.status.success() {
+            if let Ok(text) = String::from_utf8(output.stdout) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    read_ghostty_font_family()
+}
+
+fn write_ghostty_font_family(font_family: &str) -> Result<(), String> {
+    let Some(clean) = sanitize_css_font_family(font_family) else {
+        return Err("invalid font family".to_string());
+    };
+    let Some(path) = ghostty_config_path() else {
+        return Err("config directory unavailable".to_string());
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let replacement_line = format!("font-family = \"{clean}\"");
+    let mut replaced = false;
+    let mut lines: Vec<String> = existing
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with("font-family")
+                && trimmed["font-family".len()..].trim_start().starts_with('=')
+            {
+                replaced = true;
+                replacement_line.clone()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    if !replaced {
+        lines.push(replacement_line);
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    std::fs::write(&path, out).map_err(|err| err.to_string())
+}
+
 /// High-priority CSS for interface scale and custom UI font family so user
 /// GTK overrides (e.g. `~/.config/gtk-4.0/gtk.css`) cannot block Limux's
 /// in-app scale and font settings.
@@ -722,35 +809,56 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     scale_row.set_activatable_widget(Some(&scale_spin));
     group.add(&scale_row);
 
+    let system_fonts = collect_system_font_families(&page);
+    let mut ui_font_options: Vec<String> = vec!["System default".to_string()];
+    ui_font_options.extend(system_fonts.iter().cloned());
+    let ui_font_refs: Vec<&str> = ui_font_options.iter().map(String::as_str).collect();
+
     let ui_font_row = adw::ActionRow::builder()
         .title("Interface font")
-        .subtitle("Custom font family for Limux UI (leave blank for system default)")
+        .subtitle("Choose a system font for the Limux UI")
         .build();
     ui_font_row.set_title_lines(1);
     ui_font_row.set_subtitle_lines(2);
-    let ui_font_entry = gtk::Entry::builder()
-        .placeholder_text("System default")
-        .text(
-            input
-                .config
-                .borrow()
-                .appearance
-                .ui_font_family
-                .as_deref()
-                .unwrap_or(""),
-        )
-        .valign(gtk::Align::Center)
-        .width_chars(20)
-        .build();
-    let ui_font_reset_button = gtk::Button::builder()
-        .label("Default")
-        .tooltip_text("Reset interface font")
-        .valign(gtk::Align::Center)
-        .build();
-    ui_font_row.add_suffix(&ui_font_entry);
-    ui_font_row.add_suffix(&ui_font_reset_button);
-    ui_font_row.set_activatable_widget(Some(&ui_font_entry));
+    let ui_font_dropdown = searchable_font_dropdown(&ui_font_refs);
+    let current_ui_font = input.config.borrow().appearance.ui_font_family.clone();
+    let initial_ui_font_idx = current_ui_font
+        .as_deref()
+        .and_then(|f| {
+            ui_font_options
+                .iter()
+                .position(|opt| opt.eq_ignore_ascii_case(f))
+        })
+        .unwrap_or(0) as u32;
+    ui_font_dropdown.set_selected(initial_ui_font_idx);
+    ui_font_row.add_suffix(&ui_font_dropdown);
+    ui_font_row.set_activatable_widget(Some(&ui_font_dropdown));
     group.add(&ui_font_row);
+
+    let mut term_font_options: Vec<String> = vec!["Omarchy / Ghostty default".to_string()];
+    term_font_options.extend(system_fonts.iter().cloned());
+    let term_font_refs: Vec<&str> = term_font_options.iter().map(String::as_str).collect();
+
+    let term_font_row = adw::ActionRow::builder()
+        .title("Terminal font")
+        .subtitle("System font for Ghostty terminals (updates ~/.config/ghostty/config)")
+        .build();
+    term_font_row.set_title_lines(1);
+    term_font_row.set_subtitle_lines(2);
+    let term_font_dropdown = searchable_font_dropdown(&term_font_refs);
+    let current_term_font = read_ghostty_font_family();
+    let initial_term_font_idx = current_term_font
+        .as_deref()
+        .and_then(|f| {
+            term_font_options
+                .iter()
+                .position(|opt| opt.eq_ignore_ascii_case(f))
+        })
+        .unwrap_or(0) as u32;
+    term_font_dropdown.set_selected(initial_term_font_idx);
+    term_font_row.add_suffix(&term_font_dropdown);
+    term_font_row.set_activatable_widget(Some(&term_font_dropdown));
+    group.add(&term_font_row);
 
     let term_font_size_row = adw::ActionRow::builder()
         .title("Terminal font size")
@@ -905,10 +1013,14 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
     {
         let config = input.config.clone();
         let on_changed = input.on_config_changed.clone();
-        ui_font_entry.connect_changed(move |entry| {
-            let text = entry.text();
-            let font = text.trim();
-            let next = (!font.is_empty()).then(|| font.to_string());
+        let ui_font_options = Rc::new(ui_font_options);
+        ui_font_dropdown.connect_selected_notify(move |dropdown| {
+            let idx = dropdown.selected() as usize;
+            let next = if idx == 0 {
+                None
+            } else {
+                ui_font_options.get(idx).cloned()
+            };
             if next == config.borrow().appearance.ui_font_family {
                 return;
             }
@@ -918,9 +1030,17 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
         });
     }
     {
-        let ui_font_entry = ui_font_entry.clone();
-        ui_font_reset_button.connect_clicked(move |_| {
-            ui_font_entry.set_text("");
+        let term_font_options = Rc::new(term_font_options);
+        term_font_dropdown.connect_selected_notify(move |dropdown| {
+            let idx = dropdown.selected() as usize;
+            let chosen = if idx == 0 {
+                detect_omarchy_font_family()
+            } else {
+                term_font_options.get(idx).cloned()
+            };
+            if let Some(font) = chosen {
+                let _ = write_ghostty_font_family(&font);
+            }
         });
     }
     {
