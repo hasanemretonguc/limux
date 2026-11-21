@@ -106,6 +106,7 @@ pub(crate) struct AppState {
     ai_usage_badge: gtk::Label,
     issues_toggle_btn: gtk::Button,
     issues_panel: crate::github_issues::IssuesPanel,
+    tab_issue_numbers: HashMap<String, u64>,
     sidebar_header: gtk::Box,
     sidebar_header_handle: gtk::WindowHandle,
     sidebar_drag_area: gtk::Box,
@@ -2117,12 +2118,14 @@ pub fn build_window(app: &adw::Application) {
     let issues_launch_state_slot: Rc<RefCell<Option<State>>> = Rc::new(RefCell::new(None));
     let issues_panel = {
         let state_slot = issues_launch_state_slot.clone();
-        crate::github_issues::IssuesPanel::new(Rc::new(move |ws_id, tab_title, command| {
-            let Some(state) = state_slot.borrow().clone() else {
-                return;
-            };
-            launch_agent_command_in_workspace(&state, &ws_id, &tab_title, &command);
-        }))
+        crate::github_issues::IssuesPanel::new(Rc::new(
+            move |ws_id, issue_num, tab_title, command| {
+                let Some(state) = state_slot.borrow().clone() else {
+                    return;
+                };
+                launch_agent_command_in_workspace(&state, &ws_id, issue_num, &tab_title, &command);
+            },
+        ))
     };
     main_split.append(issues_panel.widget());
 
@@ -2146,6 +2149,7 @@ pub fn build_window(app: &adw::Application) {
         ai_usage_badge: ai_usage_badge.clone(),
         issues_toggle_btn: issues_toggle_btn.clone(),
         issues_panel: issues_panel.clone(),
+        tab_issue_numbers: HashMap::new(),
         sidebar_header: sidebar_header.clone(),
         sidebar_header_handle: sidebar_header_handle.clone(),
         sidebar_drag_area: sidebar_drag_area.clone(),
@@ -4037,7 +4041,13 @@ fn sync_ai_usage_badge_parent(state: &State, show_top_bar: bool) {
     }
 }
 
-fn launch_agent_command_in_workspace(state: &State, ws_id: &str, tab_title: &str, command: &str) {
+fn launch_agent_command_in_workspace(
+    state: &State,
+    ws_id: &str,
+    issue_number: u64,
+    tab_title: &str,
+    command: &str,
+) {
     let (pane_widget, folder_path) = {
         let s = state.borrow();
         let Some(ws) = s.workspaces.iter().find(|w| w.id == ws_id) else {
@@ -4051,6 +4061,10 @@ fn launch_agent_command_in_workspace(state: &State, ws_id: &str, tab_title: &str
 
     pane::add_terminal_tab_to_pane_in_directory(&pane_widget, folder_path.as_deref());
     if let Some((tab_id, handle)) = pane::active_tab_terminal_handle(&pane_widget) {
+        state
+            .borrow_mut()
+            .tab_issue_numbers
+            .insert(tab_id.clone(), issue_number);
         pane::set_auto_tab_title_in_pane(&pane_widget, &tab_id, tab_title);
         let cmd = format!("{command}\r");
         glib::timeout_add_local_once(std::time::Duration::from_millis(350), move || {
@@ -4218,6 +4232,7 @@ fn start_ai_background_loops(state: &State) {
             last_fingerprints.borrow_mut().insert(surface_id, fp);
 
             in_flight.set(true);
+            let issue_num = state.borrow().tab_issue_numbers.get(&tab_id).copied();
             let pane_weak = pane_widget.downgrade();
             let in_flight_clone = in_flight.clone();
             let (tx, rx) = std::sync::mpsc::channel();
@@ -4235,7 +4250,13 @@ fn start_ai_background_loops(state: &State) {
                     Ok(title) => {
                         in_flight_clone.set(false);
                         if let (Some(pane), Some(title)) = (pane_weak.upgrade(), title) {
-                            pane::set_auto_tab_title_in_pane(&pane, &tab_id, &title);
+                            let final_title = match issue_num {
+                                Some(num) if !title.starts_with(&format!("#{num}")) => {
+                                    format!("#{num} {title}")
+                                }
+                                _ => title,
+                            };
+                            pane::set_auto_tab_title_in_pane(&pane, &tab_id, &final_title);
                         }
                         glib::ControlFlow::Break
                     }

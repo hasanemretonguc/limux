@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -46,6 +47,28 @@ pub const GITHUB_ISSUES_CSS: &str = r#"
 .limux-issue-card:hover {
     background: alpha(@window_fg_color, 0.07);
     border-color: alpha(@accent_bg_color, 0.40);
+}
+.limux-issue-card-in-progress {
+    border-left: 3px solid #f59e0b;
+    background: alpha(#f59e0b, 0.08);
+}
+.limux-issue-section-header {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    color: alpha(@window_fg_color, 0.55);
+    padding: 6px 8px 2px 8px;
+}
+.limux-issue-section-header-active {
+    color: #f59e0b;
+}
+.limux-issue-active-pill {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 2px;
+    background: alpha(#f59e0b, 0.22);
+    color: #fbbf24;
 }
 .limux-issue-num {
     font-size: 11px;
@@ -149,6 +172,52 @@ impl GitHubIssue {
     pub fn is_open(&self) -> bool {
         self.state.eq_ignore_ascii_case("OPEN")
     }
+
+    pub fn has_in_progress_label(&self) -> bool {
+        self.labels.iter().any(|l| {
+            let norm = l.trim().to_ascii_lowercase();
+            matches!(
+                norm.as_str(),
+                "in-progress" | "in progress" | "status:in-progress" | "wip" | "working"
+            )
+        })
+    }
+}
+
+pub fn mark_issue_in_progress_on_github(dir: &Path, repo: &str, number: u64) {
+    let _ = Command::new("gh")
+        .args([
+            "label",
+            "create",
+            "in-progress",
+            "--repo",
+            repo,
+            "--color",
+            "f59e0b",
+            "--description",
+            "AI agent actively working on this issue",
+            "--force",
+        ])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = Command::new("gh")
+        .args([
+            "issue",
+            "edit",
+            &number.to_string(),
+            "--repo",
+            repo,
+            "--add-label",
+            "in-progress",
+        ])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Parse `owner/repo` from a GitHub remote URL (`git@github.com:o/r.git` or `https://github.com/o/r.git`).
@@ -524,7 +593,7 @@ pub fn create_github_issue(dir: &Path, repo: &str, title: &str, body: &str) -> R
     Ok(())
 }
 
-type OnLaunchAgent = Rc<dyn Fn(String, String, String)>;
+type OnLaunchAgent = Rc<dyn Fn(String, u64, String, String)>;
 
 #[derive(Clone)]
 pub struct IssuesPanel {
@@ -539,6 +608,7 @@ struct IssuesPanelInner {
     state_filter: String,
     search_query: String,
     issues: Vec<GitHubIssue>,
+    active_agents: HashMap<(String, u64), IssueAgent>,
     selected_issue: Option<u64>,
     header_title: gtk::Label,
     status_label: gtk::Label,
@@ -696,6 +766,7 @@ impl IssuesPanel {
             state_filter: "open".to_string(),
             search_query: String::new(),
             issues: Vec::new(),
+            active_agents: HashMap::new(),
             selected_issue: None,
             header_title,
             status_label,
@@ -915,108 +986,178 @@ impl IssuesPanel {
     }
 
     fn render_list(&self) {
-        let (list_box, issues, query) = {
+        let (list_box, issues, query, repo_name, active_agents) = {
             let s = self.inner.borrow();
             (
                 s.list_box.clone(),
                 s.issues.clone(),
                 s.search_query.trim().to_ascii_lowercase(),
+                s.repo_name.clone().unwrap_or_default(),
+                s.active_agents.clone(),
             )
         };
         while let Some(child) = list_box.first_child() {
             list_box.remove(&child);
         }
 
-        for issue in issues {
-            if !query.is_empty()
-                && !issue.title.to_ascii_lowercase().contains(&query)
-                && !issue.number.to_string().contains(&query)
-                && !issue
-                    .labels
-                    .iter()
-                    .any(|l| l.to_ascii_lowercase().contains(&query))
-            {
-                continue;
-            }
+        let filtered: Vec<GitHubIssue> = issues
+            .into_iter()
+            .filter(|issue| {
+                query.is_empty()
+                    || issue.title.to_ascii_lowercase().contains(&query)
+                    || issue.number.to_string().contains(&query)
+                    || issue
+                        .labels
+                        .iter()
+                        .any(|l| l.to_ascii_lowercase().contains(&query))
+            })
+            .collect();
 
-            let card = gtk::Box::builder()
-                .orientation(gtk::Orientation::Vertical)
-                .spacing(4)
-                .build();
-            card.add_css_class("limux-issue-card");
+        let (in_progress, other): (Vec<GitHubIssue>, Vec<GitHubIssue>) =
+            filtered.into_iter().partition(|issue| {
+                issue.is_open()
+                    && (active_agents.contains_key(&(repo_name.clone(), issue.number))
+                        || issue.has_in_progress_label())
+            });
 
-            let top = gtk::Box::builder()
-                .orientation(gtk::Orientation::Horizontal)
-                .spacing(6)
-                .build();
-            let num_lbl = gtk::Label::new(Some(&format!("#{}", issue.number)));
-            num_lbl.add_css_class("limux-issue-num");
-            if !issue.is_open() {
-                num_lbl.add_css_class("limux-issue-num-closed");
-            }
-            let title_lbl = gtk::Label::builder()
-                .label(&issue.title)
+        if !in_progress.is_empty() {
+            let header = gtk::Label::builder()
+                .label(format!("● IN PROGRESS ({})", in_progress.len()))
                 .xalign(0.0)
-                .hexpand(true)
-                .ellipsize(gtk::pango::EllipsizeMode::End)
                 .build();
-            title_lbl.add_css_class("limux-issue-title");
-            let comments_lbl = gtk::Label::new(Some(&format!("💬 {}", issue.comments.len())));
-            comments_lbl.add_css_class("limux-issue-meta");
-            top.append(&num_lbl);
-            top.append(&title_lbl);
-            top.append(&comments_lbl);
-            card.append(&top);
+            header.add_css_class("limux-issue-section-header");
+            header.add_css_class("limux-issue-section-header-active");
+            let header_row = gtk::ListBoxRow::new();
+            header_row.set_activatable(false);
+            header_row.set_selectable(false);
+            header_row.set_child(Some(&header));
+            list_box.append(&header_row);
 
-            if !issue.labels.is_empty() {
-                let labels_row = gtk::Box::builder()
-                    .orientation(gtk::Orientation::Horizontal)
-                    .spacing(4)
-                    .build();
-                for label in issue.labels.iter().take(4) {
-                    let chip = gtk::Label::new(Some(label));
-                    chip.add_css_class("limux-issue-label");
-                    labels_row.append(&chip);
-                }
-                card.append(&labels_row);
+            for issue in in_progress {
+                let running_agent = active_agents
+                    .get(&(repo_name.clone(), issue.number))
+                    .copied();
+                self.append_issue_row(&list_box, issue, true, running_agent);
             }
+        }
 
-            let actions = gtk::Box::builder()
+        if !other.is_empty() {
+            if !list_box.first_child().is_none() {
+                let header = gtk::Label::builder()
+                    .label(format!("ISSUES ({})", other.len()))
+                    .xalign(0.0)
+                    .build();
+                header.add_css_class("limux-issue-section-header");
+                let header_row = gtk::ListBoxRow::new();
+                header_row.set_activatable(false);
+                header_row.set_selectable(false);
+                header_row.set_child(Some(&header));
+                list_box.append(&header_row);
+            }
+            for issue in other {
+                self.append_issue_row(&list_box, issue, false, None);
+            }
+        }
+    }
+
+    fn append_issue_row(
+        &self,
+        list_box: &gtk::ListBox,
+        issue: GitHubIssue,
+        is_in_progress: bool,
+        running_agent: Option<IssueAgent>,
+    ) {
+        let card = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(4)
+            .build();
+        card.add_css_class("limux-issue-card");
+        if is_in_progress {
+            card.add_css_class("limux-issue-card-in-progress");
+        }
+
+        let top = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .build();
+        let num_lbl = gtk::Label::new(Some(&format!("#{}", issue.number)));
+        num_lbl.add_css_class("limux-issue-num");
+        if !issue.is_open() {
+            num_lbl.add_css_class("limux-issue-num-closed");
+        }
+        let title_lbl = gtk::Label::builder()
+            .label(&issue.title)
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        title_lbl.add_css_class("limux-issue-title");
+        top.append(&num_lbl);
+        top.append(&title_lbl);
+
+        if is_in_progress {
+            let pill_text = match running_agent {
+                Some(agent) => format!("● {}", agent.label()),
+                None => "● In Progress".to_string(),
+            };
+            let pill = gtk::Label::new(Some(&pill_text));
+            pill.add_css_class("limux-issue-active-pill");
+            top.append(&pill);
+        }
+
+        let comments_lbl = gtk::Label::new(Some(&format!("💬 {}", issue.comments.len())));
+        comments_lbl.add_css_class("limux-issue-meta");
+        top.append(&comments_lbl);
+        card.append(&top);
+
+        if !issue.labels.is_empty() {
+            let labels_row = gtk::Box::builder()
                 .orientation(gtk::Orientation::Horizontal)
                 .spacing(4)
-                .margin_top(2)
                 .build();
-            for agent in [IssueAgent::GeminiAgy, IssueAgent::Claude, IssueAgent::Codex] {
-                let btn = gtk::Button::with_label(&format!("▶ {}", agent.label()));
-                btn.add_css_class("limux-issue-action-btn");
-                btn.set_tooltip_text(Some(&format!(
-                    "Start {} on issue #{} with full context & notes",
-                    agent.label(),
-                    issue.number
-                )));
-                let panel = self.clone();
-                let num = issue.number;
-                btn.connect_clicked(move |_| {
-                    panel.launch_agent_for_issue(num, agent);
-                });
-                actions.append(&btn);
+            for label in issue.labels.iter().take(4) {
+                let chip = gtk::Label::new(Some(label));
+                chip.add_css_class("limux-issue-label");
+                labels_row.append(&chip);
             }
-            let detail_btn = gtk::Button::with_label("Notes");
-            detail_btn.add_css_class("limux-issue-action-btn");
-            {
-                let panel = self.clone();
-                let num = issue.number;
-                detail_btn.connect_clicked(move |_| {
-                    panel.open_detail(num);
-                });
-            }
-            actions.append(&detail_btn);
-            card.append(&actions);
-
-            let row = gtk::ListBoxRow::new();
-            row.set_child(Some(&card));
-            list_box.append(&row);
+            card.append(&labels_row);
         }
+
+        let actions = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(4)
+            .margin_top(2)
+            .build();
+        for agent in [IssueAgent::GeminiAgy, IssueAgent::Claude, IssueAgent::Codex] {
+            let btn = gtk::Button::with_label(&format!("▶ {}", agent.label()));
+            btn.add_css_class("limux-issue-action-btn");
+            btn.set_tooltip_text(Some(&format!(
+                "Start {} on issue #{} with full context & notes",
+                agent.label(),
+                issue.number
+            )));
+            let panel = self.clone();
+            let num = issue.number;
+            btn.connect_clicked(move |_| {
+                panel.launch_agent_for_issue(num, agent);
+            });
+            actions.append(&btn);
+        }
+        let detail_btn = gtk::Button::with_label("Notes");
+        detail_btn.add_css_class("limux-issue-action-btn");
+        {
+            let panel = self.clone();
+            let num = issue.number;
+            detail_btn.connect_clicked(move |_| {
+                panel.open_detail(num);
+            });
+        }
+        actions.append(&detail_btn);
+        card.append(&actions);
+
+        let row = gtk::ListBoxRow::new();
+        row.set_child(Some(&card));
+        list_box.append(&row);
     }
 
     fn open_detail(&self, number: u64) {
@@ -1065,7 +1206,12 @@ impl IssuesPanel {
             let close = issue.is_open();
             state_btn.connect_clicked(move |btn| {
                 let (Some(dir), Some(repo)) = ({
-                    let s = panel.inner.borrow();
+                    let mut s = panel.inner.borrow_mut();
+                    if close {
+                        if let Some(r) = s.repo_name.clone() {
+                            s.active_agents.remove(&(r, number));
+                        }
+                    }
                     (s.workspace_dir.clone(), s.repo_name.clone())
                 }) else {
                     return;
@@ -1221,8 +1367,8 @@ impl IssuesPanel {
     }
 
     fn launch_agent_for_issue(&self, number: u64, agent: IssueAgent) {
-        let (ws_id, repo, issue, on_launch) = {
-            let s = self.inner.borrow();
+        let (ws_id, ws_dir, repo, issue, on_launch) = {
+            let mut s = self.inner.borrow_mut();
             let Some(ws_id) = s.workspace_id.clone() else {
                 return;
             };
@@ -1232,15 +1378,31 @@ impl IssuesPanel {
             let Some(issue) = s.issues.iter().find(|i| i.number == number).cloned() else {
                 return;
             };
-            (ws_id, repo, issue, s.on_launch_agent.clone())
+            s.active_agents.insert((repo.clone(), number), agent);
+            (
+                ws_id,
+                s.workspace_dir.clone(),
+                repo,
+                issue,
+                s.on_launch_agent.clone(),
+            )
         };
+
+        self.render_list();
+
+        if let Some(dir) = ws_dir {
+            let repo_bg = repo.clone();
+            std::thread::spawn(move || {
+                mark_issue_in_progress_on_github(&dir, &repo_bg, number);
+            });
+        }
 
         let Ok((context_file, notes_file)) = write_full_issue_context_file(&repo, &issue) else {
             return;
         };
         let command = build_issue_agent_command(agent, &repo, &issue, &context_file, &notes_file);
         let tab_title = format!("#{} {}", issue.number, agent.label());
-        on_launch(ws_id, tab_title, command);
+        on_launch(ws_id, issue.number, tab_title, command);
     }
 }
 
