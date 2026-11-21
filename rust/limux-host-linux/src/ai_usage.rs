@@ -1,11 +1,15 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use limux_control::agent_sessions::AgentKind;
 use serde_json::Value;
 
 const TODAY_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+const QUOTA_CACHE_TTL: Duration = Duration::from_secs(60);
+const QUOTA_CMD_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_CLAUDE_FILES_TO_SCAN: usize = 30;
 const MAX_AGY_FILES_TO_SCAN: usize = 25;
 
@@ -39,9 +43,29 @@ pub const AI_USAGE_CSS: &str = r#"
 "#;
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct QuotaWindow {
+    pub used_percent: f64,
+    pub resets_at: Option<String>,
+}
+
+impl QuotaWindow {
+    pub fn remaining_percent(&self) -> f64 {
+        (100.0 - self.used_percent).clamp(0.0, 100.0)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct QuotaSnapshot {
+    pub five_hour: Option<QuotaWindow>,
+    pub seven_day: Option<QuotaWindow>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct AiToolUsage {
     pub agent: AgentKind,
     pub model: Option<String>,
+    pub five_hour: Option<QuotaWindow>,
+    pub seven_day: Option<QuotaWindow>,
     pub session_input_tokens: u64,
     pub session_output_tokens: u64,
     pub session_cache_read_tokens: u64,
@@ -78,15 +102,26 @@ impl AiToolUsage {
 
     pub fn format_badge(&self) -> String {
         let name = self.short_agent_name();
-        let tok = self.session_total_tokens();
-        match (tok > 0, self.session_cost_usd) {
-            (true, Some(cost)) => format!("{name} · {} · ${cost:.2}", format_tokens(tok)),
-            (true, None) => format!("{name} · {}", format_tokens(tok)),
-            (false, Some(cost)) => format!("{name} · ${cost:.2}"),
-            (false, None) if self.today_total_tokens > 0 => {
-                format!("{name} · today {}", format_tokens(self.today_total_tokens))
+        match (&self.five_hour, &self.seven_day) {
+            (Some(fh), Some(sd)) => format!(
+                "{name} · 5h {:.0}% · 7d {:.0}%",
+                fh.used_percent.clamp(0.0, 100.0),
+                sd.used_percent.clamp(0.0, 100.0)
+            ),
+            (Some(fh), None) => format!("{name} · 5h {:.0}%", fh.used_percent.clamp(0.0, 100.0)),
+            (None, Some(sd)) => format!("{name} · 7d {:.0}%", sd.used_percent.clamp(0.0, 100.0)),
+            (None, None) => {
+                let tok = self.session_total_tokens();
+                match (tok > 0, self.session_cost_usd) {
+                    (true, Some(cost)) => format!("{name} · {} · ${cost:.2}", format_tokens(tok)),
+                    (true, None) => format!("{name} · {}", format_tokens(tok)),
+                    (false, Some(cost)) => format!("{name} · ${cost:.2}"),
+                    (false, None) if self.today_total_tokens > 0 => {
+                        format!("{name} · today {}", format_tokens(self.today_total_tokens))
+                    }
+                    (false, None) => format!("{name} · active"),
+                }
             }
-            (false, None) => format!("{name} · active"),
         }
     }
 
@@ -98,6 +133,28 @@ impl AiToolUsage {
         let mut lines = vec![format!("Active AI Tool: {tool_name}")];
         if let Some(model) = self.model.as_deref().filter(|m| !m.is_empty()) {
             lines.push(format!("Model: {model}"));
+        }
+        if let Some(fh) = &self.five_hour {
+            let mut line = format!(
+                "5-hour usage: {:.0}% used ({:.0}% left)",
+                fh.used_percent.clamp(0.0, 100.0),
+                fh.remaining_percent()
+            );
+            if let Some(reset) = fh.resets_at.as_deref().filter(|s| !s.is_empty()) {
+                line.push_str(&format!(" · resets {reset}"));
+            }
+            lines.push(line);
+        }
+        if let Some(sd) = &self.seven_day {
+            let mut line = format!(
+                "Weekly usage: {:.0}% used ({:.0}% left)",
+                sd.used_percent.clamp(0.0, 100.0),
+                sd.remaining_percent()
+            );
+            if let Some(reset) = sd.resets_at.as_deref().filter(|s| !s.is_empty()) {
+                line.push_str(&format!(" · resets {reset}"));
+            }
+            lines.push(line);
         }
         let session_total = self.session_total_tokens();
         if session_total > 0 {
@@ -255,8 +312,8 @@ fn detect_active_agent_in_state_dir(
     best_surface.or(best_workspace).map(|(_, ctx)| ctx)
 }
 
-/// Collect usage statistics for the detected active AI tool.
-/// Intended to run on a background thread so filesystem scans never block GTK.
+/// Collect usage statistics (including cached 5h/7d quota percentages) for the
+/// detected active AI tool. Runs on a background thread.
 pub fn collect_usage_for_context(ctx: &ActiveAgentContext) -> AiToolUsage {
     let home = dirs::home_dir();
     match ctx.agent {
@@ -265,6 +322,8 @@ pub fn collect_usage_for_context(ctx: &ActiveAgentContext) -> AiToolUsage {
         other => AiToolUsage {
             agent: other,
             model: None,
+            five_hour: None,
+            seven_day: None,
             session_input_tokens: 0,
             session_output_tokens: 0,
             session_cache_read_tokens: 0,
@@ -275,10 +334,205 @@ pub fn collect_usage_for_context(ctx: &ActiveAgentContext) -> AiToolUsage {
     }
 }
 
+fn cached_agy_quota() -> QuotaSnapshot {
+    static CACHE: OnceLock<Mutex<Option<(Instant, QuotaSnapshot)>>> = OnceLock::new();
+    let lock = CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = lock.lock() {
+        if let Some((fetched_at, snapshot)) = guard.as_ref() {
+            if fetched_at.elapsed() < QUOTA_CACHE_TTL {
+                return snapshot.clone();
+            }
+        }
+    }
+    let fresh = fetch_agy_quota_via_cli().unwrap_or_default();
+    if let Ok(mut guard) = lock.lock() {
+        *guard = Some((Instant::now(), fresh.clone()));
+    }
+    fresh
+}
+
+fn fetch_agy_quota_via_cli() -> Option<QuotaSnapshot> {
+    let stdout = run_command_with_timeout("agy", &["-p", "/usage"], QUOTA_CMD_TIMEOUT)?;
+    parse_agy_usage_output(&stdout)
+}
+
+/// Parse `agy -p /usage` tab-separated output into 5-hour and weekly usage
+/// percentages (`used = 100 - remaining`).
+pub fn parse_agy_usage_output(output: &str) -> Option<QuotaSnapshot> {
+    let mut snapshot = QuotaSnapshot::default();
+
+    for raw_line in output.lines() {
+        let cols: Vec<&str> = raw_line.split('\t').map(str::trim).collect();
+        if cols.len() < 3 {
+            continue;
+        }
+        let group = cols[0].to_ascii_lowercase();
+        let metric = cols[1].to_ascii_lowercase();
+        let Some(pct) = cols[2]
+            .strip_suffix('%')
+            .and_then(|v| v.trim().parse::<f64>().ok())
+        else {
+            continue;
+        };
+        let resets_at = cols
+            .get(3)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+
+        // Prefer the "Gemini Models" bucket for Antigravity Gemini usage.
+        if !group.contains("gemini models") {
+            continue;
+        }
+        let used_percent = if metric.contains("remaining") {
+            (100.0 - pct).clamp(0.0, 100.0)
+        } else {
+            pct.clamp(0.0, 100.0)
+        };
+
+        if metric.contains("five hour") || metric.contains("5 hour") || metric.contains("5h") {
+            snapshot.five_hour = Some(QuotaWindow {
+                used_percent,
+                resets_at,
+            });
+        } else if metric.contains("weekly") || metric.contains("7 day") || metric.contains("7d") {
+            snapshot.seven_day = Some(QuotaWindow {
+                used_percent,
+                resets_at,
+            });
+        }
+    }
+
+    (snapshot.five_hour.is_some() || snapshot.seven_day.is_some()).then_some(snapshot)
+}
+
+fn cached_claude_quota(home: Option<&Path>) -> QuotaSnapshot {
+    // Allow an optional local statusline-written rate limits file to win immediately.
+    if let Some(state_dir) = limux_state_dir() {
+        let local_path = state_dir.join("claude-rate-limits.json");
+        if let Ok(raw) = fs::read_to_string(&local_path) {
+            if let Some(parsed) = parse_claude_oauth_usage_json(&raw) {
+                return parsed;
+            }
+        }
+    }
+
+    static CACHE: OnceLock<Mutex<Option<(Instant, QuotaSnapshot)>>> = OnceLock::new();
+    let lock = CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = lock.lock() {
+        if let Some((fetched_at, snapshot)) = guard.as_ref() {
+            if fetched_at.elapsed() < QUOTA_CACHE_TTL {
+                return snapshot.clone();
+            }
+        }
+    }
+    let fresh = fetch_claude_quota_via_oauth(home).unwrap_or_default();
+    if let Ok(mut guard) = lock.lock() {
+        *guard = Some((Instant::now(), fresh.clone()));
+    }
+    fresh
+}
+
+fn fetch_claude_quota_via_oauth(home: Option<&Path>) -> Option<QuotaSnapshot> {
+    let creds_path = home?.join(".claude/.credentials.json");
+    let raw = fs::read_to_string(creds_path).ok()?;
+    let root: Value = serde_json::from_str(&raw).ok()?;
+    let token = root
+        .get("claudeAiOauth")
+        .and_then(|o| o.get("accessToken"))
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())?;
+
+    let auth_header = format!("Authorization: Bearer {token}");
+    let stdout = run_command_with_timeout(
+        "curl",
+        &[
+            "-sf",
+            "--max-time",
+            "5",
+            "-H",
+            &auth_header,
+            "-H",
+            "anthropic-beta: oauth-2025-04-20",
+            "-H",
+            "User-Agent: claude-code/2.1",
+            "https://api.anthropic.com/api/oauth/usage",
+        ],
+        QUOTA_CMD_TIMEOUT,
+    )?;
+    parse_claude_oauth_usage_json(&stdout)
+}
+
+/// Parse Claude `/api/oauth/usage` or statusline `rate_limits` JSON into 5h/7d windows.
+pub fn parse_claude_oauth_usage_json(raw: &str) -> Option<QuotaSnapshot> {
+    let root: Value = serde_json::from_str(raw).ok()?;
+    let container = root.get("rate_limits").unwrap_or(&root);
+
+    let parse_window = |obj: &Value| -> Option<QuotaWindow> {
+        let used = obj
+            .get("utilization")
+            .or_else(|| obj.get("used_percentage"))
+            .and_then(Value::as_f64)?;
+        let resets_at = obj
+            .get("resets_at")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        Some(QuotaWindow {
+            used_percent: used.clamp(0.0, 100.0),
+            resets_at,
+        })
+    };
+
+    let five_hour = container.get("five_hour").and_then(parse_window);
+    let seven_day = container.get("seven_day").and_then(parse_window);
+    (five_hour.is_some() || seven_day.is_some()).then_some(QuotaSnapshot {
+        five_hour,
+        seven_day,
+    })
+}
+
+fn run_command_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let output = child.wait_with_output().ok()?;
+                return String::from_utf8(output.stdout).ok();
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                return None;
+            }
+        }
+    }
+}
+
 fn collect_claude_usage(home: Option<&Path>, ctx: &ActiveAgentContext) -> AiToolUsage {
+    let quota = cached_claude_quota(home);
     let mut usage = AiToolUsage {
         agent: AgentKind::Claude,
         model: None,
+        five_hour: quota.five_hour,
+        seven_day: quota.seven_day,
         session_input_tokens: 0,
         session_output_tokens: 0,
         session_cache_read_tokens: 0,
@@ -366,11 +620,11 @@ fn encode_claude_project_dir(cwd: &str) -> String {
 
 #[derive(Default)]
 pub struct ParsedTokenUsage {
-    model: Option<String>,
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_tokens: u64,
-    cost_usd: Option<f64>,
+    pub model: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cost_usd: Option<f64>,
 }
 
 pub fn parse_claude_jsonl_usage(contents: &str) -> Option<ParsedTokenUsage> {
@@ -460,9 +714,12 @@ pub fn parse_claude_jsonl_usage(contents: &str) -> Option<ParsedTokenUsage> {
 }
 
 fn collect_agy_usage(home: Option<&Path>, ctx: &ActiveAgentContext) -> AiToolUsage {
+    let quota = cached_agy_quota();
     let mut usage = AiToolUsage {
         agent: AgentKind::Agy,
         model: None,
+        five_hour: quota.five_hour,
+        seven_day: quota.seven_day,
         session_input_tokens: 0,
         session_output_tokens: 0,
         session_cache_read_tokens: 0,
@@ -608,10 +865,38 @@ fn collect_recent_files_recursive(
 mod tests {
     use super::{
         detect_active_agent_in_state_dir, format_tokens, parse_agy_transcript_usage,
-        parse_claude_jsonl_usage, AiToolUsage,
+        parse_agy_usage_output, parse_claude_jsonl_usage, parse_claude_oauth_usage_json,
+        AiToolUsage, QuotaWindow,
     };
     use limux_control::agent_sessions::AgentKind;
     use std::fs;
+
+    #[test]
+    fn parses_agy_usage_tsv_into_5h_and_weekly_used_percentages() {
+        let sample = "\
+Gemini Models\tWeekly Limit Remaining\t63%\t2026-11-28T09:35:29Z
+Gemini Models\tFive Hour Limit Remaining\t46%\t2026-11-22T02:40:24Z
+Claude and GPT models\tWeekly Limit Remaining\t100%\t2026-11-28T22:28:59Z
+";
+        let quota = parse_agy_usage_output(sample).expect("should parse agy /usage");
+        let fh = quota.five_hour.expect("5h quota");
+        let sd = quota.seven_day.expect("7d quota");
+        assert!((fh.used_percent - 54.0).abs() < 0.01);
+        assert_eq!(fh.resets_at.as_deref(), Some("2026-11-22T02:40:24Z"));
+        assert!((sd.used_percent - 37.0).abs() < 0.01);
+        assert_eq!(sd.resets_at.as_deref(), Some("2026-11-28T09:35:29Z"));
+    }
+
+    #[test]
+    fn parses_claude_oauth_usage_json() {
+        let sample = r#"{
+            "five_hour": { "utilization": 34.0, "resets_at": "2026-11-22T05:00:00Z" },
+            "seven_day": { "utilization": 61.5, "resets_at": "2026-11-28T00:00:00Z" }
+        }"#;
+        let quota = parse_claude_oauth_usage_json(sample).expect("should parse claude quota");
+        assert!((quota.five_hour.unwrap().used_percent - 34.0).abs() < 0.01);
+        assert!((quota.seven_day.unwrap().used_percent - 61.5).abs() < 0.01);
+    }
 
     #[test]
     fn parses_claude_cost_state_jsonl() {
@@ -641,14 +926,40 @@ mod tests {
     }
 
     #[test]
-    fn formats_tokens_and_badge_and_tooltip() {
+    fn formats_quota_badge_and_tooltip_and_token_fallback() {
         assert_eq!(format_tokens(950), "950");
         assert_eq!(format_tokens(42_150), "42.1k");
         assert_eq!(format_tokens(3_450_000), "3.5M");
 
-        let usage = AiToolUsage {
+        let gemini_quota = AiToolUsage {
+            agent: AgentKind::Agy,
+            model: Some("gemini-4-neon-medium".to_string()),
+            five_hour: Some(QuotaWindow {
+                used_percent: 54.0,
+                resets_at: Some("2026-11-22T02:40:24Z".to_string()),
+            }),
+            seven_day: Some(QuotaWindow {
+                used_percent: 37.0,
+                resets_at: Some("2026-11-28T09:35:29Z".to_string()),
+            }),
+            session_input_tokens: 1_000,
+            session_output_tokens: 500,
+            session_cache_read_tokens: 40_500,
+            session_cost_usd: None,
+            today_total_tokens: 120_000,
+            today_cost_usd: None,
+        };
+        assert_eq!(gemini_quota.format_badge(), "Gemini · 5h 54% · 7d 37%");
+        let tooltip = gemini_quota.format_tooltip();
+        assert!(tooltip.contains("Active AI Tool: Gemini (Antigravity)"));
+        assert!(tooltip.contains("5-hour usage: 54% used (46% left)"));
+        assert!(tooltip.contains("Weekly usage: 37% used (63% left)"));
+
+        let claude_fallback = AiToolUsage {
             agent: AgentKind::Claude,
             model: Some("claude-sonnet-5-5".to_string()),
+            five_hour: None,
+            seven_day: None,
             session_input_tokens: 1_000,
             session_output_tokens: 500,
             session_cache_read_tokens: 40_500,
@@ -656,11 +967,7 @@ mod tests {
             today_total_tokens: 120_000,
             today_cost_usd: Some(0.75),
         };
-        assert_eq!(usage.format_badge(), "Claude · 42.0k · $0.18");
-        let tooltip = usage.format_tooltip();
-        assert!(tooltip.contains("Active AI Tool: Claude"));
-        assert!(tooltip.contains("Model: claude-sonnet-5-5"));
-        assert!(tooltip.contains("Last 24h: 120.0k tok · $0.75"));
+        assert_eq!(claude_fallback.format_badge(), "Claude · 42.0k · $0.18");
     }
 
     #[test]
