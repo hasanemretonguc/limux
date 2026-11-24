@@ -1,0 +1,61 @@
+# Maintainer: Hasan Emre Tonguc
+pkgname=limux-custom-git
+pkgver=0.1.36
+pkgrel=1
+pkgdesc="Custom AI-workflow & Omarchy-themed build of Limux terminal workspace manager"
+arch=('x86_64')
+url="https://github.com/hasanemretonguc/limux"
+license=('MIT')
+depends=('fontconfig' 'glib2' 'gtk4' 'hicolor-icon-theme' 'libadwaita' 'pango' 'webkitgtk-6.0')
+optdepends=('wl-clipboard: Ctrl+V paste in shells & CLI tools on Wayland')
+provides=('limux')
+conflicts=('limux' 'limux-bin' 'limux-debug')
+replaces=('limux-bin')
+options=(!debug !strip)
+
+_repo_root="${LIMUX_REPO_ROOT:-$(cd "$startdir/../.." && pwd)}"
+
+pkgver() {
+    cd "$_repo_root"
+    local base_ver rev hash
+    base_ver="$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+    rev="$(git rev-list --count HEAD)"
+    hash="$(git rev-parse --short HEAD)"
+    printf "%s.r%s.g%s" "$base_ver" "$rev" "$hash"
+}
+
+package() {
+    cd "$_repo_root"
+
+    install -Dm755 target/release/limux-cli "${pkgdir}/usr/bin/limux"
+    install -Dm755 target/release/limux "${pkgdir}/usr/libexec/limux/limux-host"
+
+    if [ -f ghostty/zig-out/lib/libghostty-internal.so ]; then
+        install -Dm644 ghostty/zig-out/lib/libghostty-internal.so "${pkgdir}/usr/lib/limux/libghostty-internal.so"
+    elif [ -f /usr/lib/limux/libghostty-internal.so ]; then
+        install -Dm644 /usr/lib/limux/libghostty-internal.so "${pkgdir}/usr/lib/limux/libghostty-internal.so"
+    else
+        echo "ERROR: libghostty-internal.so not found" >&2
+        return 1
+    fi
+
+    install -Dm644 /dev/stdin "${pkgdir}/etc/ld.so.conf.d/limux.conf" <<< "/usr/lib/limux"
+    install -Dm644 rust/limux-host-linux/dev.limux.linux.desktop "${pkgdir}/usr/share/applications/dev.limux.linux.desktop"
+    install -Dm644 rust/limux-host-linux/dev.limux.linux.metainfo.xml "${pkgdir}/usr/share/metainfo/dev.limux.linux.metainfo.xml"
+
+    for size in 16 32 128 256 512; do
+        install -Dm644 "rust/limux-host-linux/icons/app/${size}.png" \
+            "${pkgdir}/usr/share/icons/hicolor/${size}x${size}/apps/limux.png"
+    done
+    install -dm755 "${pkgdir}/usr/share/icons/hicolor/scalable/actions"
+    cp -r rust/limux-host-linux/icons/hicolor/scalable/actions/*.svg \
+        "${pkgdir}/usr/share/icons/hicolor/scalable/actions/"
+
+    if [ -d /usr/share/limux/ghostty ]; then
+        install -dm755 "${pkgdir}/usr/share/limux"
+        cp -r /usr/share/limux/ghostty "${pkgdir}/usr/share/limux/"
+    elif [ -d ghostty/zig-out/share/ghostty ]; then
+        install -dm755 "${pkgdir}/usr/share/limux"
+        cp -r ghostty/zig-out/share/ghostty "${pkgdir}/usr/share/limux/"
+    fi
+}

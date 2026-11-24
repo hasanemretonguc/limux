@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
 export PATH="$HOME/.cargo/bin:$HOME/.local/share/mise/shims:$PATH"
 export LD_LIBRARY_PATH="$ROOT_DIR/ghostty/zig-out/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
@@ -30,7 +30,17 @@ fi
 echo "==> Building release binaries (limux-host-linux & limux-cli)..."
 cargo build --release --locked -p limux-host-linux -p limux-cli
 
-echo "==> Installing updated binaries via pkexec..."
-pkexec sh -c "install -m755 '$ROOT_DIR/target/release/limux' /usr/libexec/limux/limux-host && install -m755 '$ROOT_DIR/target/release/limux-cli' /usr/bin/limux"
+echo "==> Packaging Arch package (limux-custom-git)..."
+PKG_STAGE="$(mktemp -d /tmp/limux-pkg.XXXXXX)"
+trap 'rm -rf "$PKG_STAGE"' EXIT
+cp "$ROOT_DIR/packaging/arch/PKGBUILD" "$PKG_STAGE/PKGBUILD"
+(
+  cd "$PKG_STAGE"
+  LIMUX_REPO_ROOT="$ROOT_DIR" makepkg -f --noconfirm
+)
+PKG_FILE="$(ls -t "$PKG_STAGE"/limux-custom-git-*.pkg.tar.* | head -n 1)"
 
-echo "==> Done! Restart Limux to use the updated build."
+echo "==> Installing $PKG_FILE via pkexec pacman -U..."
+pkexec pacman -U --noconfirm "$PKG_FILE"
+
+echo "==> Done! Installed $(pacman -Q limux-custom-git). Restart Limux to use the updated build."
