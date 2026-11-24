@@ -155,7 +155,9 @@ pub(crate) struct AppState {
     _theme_portal_signal: Option<gio::SignalSubscription>,
     _theme_gnome_settings: Option<gio::Settings>,
     _theme_gnome_signal: Option<glib::SignalHandlerId>,
-    _omarchy_theme_monitors: Vec<gio::FileMonitor>,
+    /// Live reload for the Omarchy interface theme; `Some` only while
+    /// `appearance.ui_theme` is Omarchy. Dropping it cancels the monitors.
+    omarchy_theme_watcher: Option<crate::omarchy_theme::OmarchyThemeWatcher>,
     _desktop_notification_token_signal: Option<gio::SignalSubscription>,
     _desktop_notification_action_signal: Option<gio::SignalSubscription>,
     _desktop_notification_closed_signal: Option<gio::SignalSubscription>,
@@ -2119,7 +2121,7 @@ pub fn build_window(app: &adw::Application) {
         _theme_portal_signal: None,
         _theme_gnome_settings: None,
         _theme_gnome_signal: None,
-        _omarchy_theme_monitors: Vec::new(),
+        omarchy_theme_watcher: None,
         _desktop_notification_token_signal: None,
         _desktop_notification_action_signal: None,
         _desktop_notification_closed_signal: None,
@@ -2205,29 +2207,11 @@ pub fn build_window(app: &adw::Application) {
         )
     });
     {
-        let state_for_watch = state.clone();
-        let style_manager_for_watch = style_manager.clone();
-        let omarchy_monitors = crate::omarchy_theme::watch_omarchy_theme(move || {
-            let (config_snapshot, system_prefers_dark) = {
-                let s = state_for_watch.borrow();
-                let cfg = s.config.borrow().clone();
-                let prefers_dark = s.system_prefers_dark.get();
-                (cfg, prefers_dark)
-            };
-            if config_snapshot.appearance.ui_theme == app_config::UiTheme::Omarchy {
-                apply_appearance(
-                    &style_manager_for_watch,
-                    system_prefers_dark,
-                    &config_snapshot.appearance,
-                );
-                reload_app_css(&state_for_watch, &config_snapshot);
-            }
-        });
         let mut s = state.borrow_mut();
         s._theme_gnome_settings = gnome_interface_settings.clone();
         s._theme_gnome_signal = theme_gnome_signal;
-        s._omarchy_theme_monitors = omarchy_monitors;
     }
+    sync_omarchy_theme_watcher(&state);
     connect_portal_appearance_watch_async(
         gnome_interface_settings.clone(),
         state.clone(),
@@ -2376,6 +2360,7 @@ pub fn build_window(app: &adw::Application) {
                 return glib::Propagation::Stop;
             }
             stop_session_saves_for_shutdown(&state);
+            stop_omarchy_theme_watcher(&state);
             let split_containers: Vec<_> = state
                 .borrow()
                 .workspaces
@@ -3079,6 +3064,7 @@ fn handle_config_change(
     let style_manager = adw::StyleManager::default();
     let system_prefers_dark = state.borrow().system_prefers_dark.get();
     apply_appearance(&style_manager, system_prefers_dark, &updated.appearance);
+    sync_omarchy_theme_watcher(state);
     if updated.appearance.ui_scale != previous.appearance.ui_scale
         || updated.appearance.unread_color != previous.appearance.unread_color
         || updated.appearance.ui_theme != previous.appearance.ui_theme
@@ -3098,6 +3084,7 @@ fn handle_config_change(
     if let Err(err) = app_config::save(updated) {
         state.borrow().config.borrow_mut().clone_from(previous);
         apply_appearance(&style_manager, system_prefers_dark, &previous.appearance);
+        sync_omarchy_theme_watcher(state);
         if updated.appearance.ui_scale != previous.appearance.ui_scale
             || updated.appearance.unread_color != previous.appearance.unread_color
             || updated.appearance.ui_theme != previous.appearance.ui_theme
@@ -3673,7 +3660,7 @@ fn sync_ghostty_color_scheme_for_config(
 ) {
     let dark = ghostty_prefers_dark(
         appearance.ghostty_color_scheme,
-        system_prefers_dark,
+        effective_system_prefers_dark(system_prefers_dark, appearance),
         style_manager.is_dark(),
     );
     crate::terminal::sync_color_scheme(dark);
@@ -3700,14 +3687,72 @@ fn apply_appearance(
         appearance.color_scheme
     };
     style_manager.set_color_scheme(adw_color_scheme_for(effective_scheme));
-    let effective_system_dark = if appearance.ui_theme == app_config::UiTheme::Omarchy {
-        crate::omarchy_theme::load_active_palette()
-            .map(|palette| palette.is_dark)
-            .or(system_prefers_dark)
-    } else {
-        system_prefers_dark
+    sync_ghostty_color_scheme_for_config(style_manager, system_prefers_dark, appearance);
+}
+
+/// The "system" dark preference Ghostty's `System` scheme should follow.
+///
+/// Under the Omarchy interface theme the active Omarchy palette's polarity
+/// stands in for the desktop preference. Every Ghostty sync (startup, portal
+/// and GSettings changes, `StyleManager` dark notifications, Omarchy reloads)
+/// funnels through `sync_ghostty_color_scheme_for_config`, so a late portal
+/// answer can no longer flip Ghostty away from the Omarchy theme.
+fn effective_system_prefers_dark(
+    system_prefers_dark: Option<bool>,
+    appearance: &app_config::AppearanceConfig,
+) -> Option<bool> {
+    if appearance.ui_theme == app_config::UiTheme::Omarchy {
+        if let Some(palette) = crate::omarchy_theme::load_active_palette() {
+            return Some(palette.is_dark);
+        }
+    }
+    system_prefers_dark
+}
+
+/// Start or stop Omarchy live reload so it runs only while the interface
+/// theme is Omarchy.
+fn sync_omarchy_theme_watcher(state: &State) {
+    let wants_watcher =
+        state.borrow().config.borrow().appearance.ui_theme == app_config::UiTheme::Omarchy;
+    if wants_watcher == state.borrow().omarchy_theme_watcher.is_some() {
+        return;
+    }
+    if !wants_watcher {
+        stop_omarchy_theme_watcher(state);
+        return;
+    }
+    // A weak reference keeps the watcher (owned by `AppState`) from holding
+    // `AppState` alive through its callback.
+    let weak_state = Rc::downgrade(state);
+    let watcher = crate::omarchy_theme::OmarchyThemeWatcher::start(move || {
+        if let Some(state) = weak_state.upgrade() {
+            reload_omarchy_theme(&state);
+        }
+    });
+    state.borrow_mut().omarchy_theme_watcher = Some(watcher);
+}
+
+fn stop_omarchy_theme_watcher(state: &State) {
+    // Take it out first so the monitors are cancelled outside the borrow.
+    let watcher = state.borrow_mut().omarchy_theme_watcher.take();
+    drop(watcher);
+}
+
+fn reload_omarchy_theme(state: &State) {
+    let (config, system_prefers_dark) = {
+        let s = state.borrow();
+        let config = s.config.borrow().clone();
+        (config, s.system_prefers_dark.get())
     };
-    sync_ghostty_color_scheme_for_config(style_manager, effective_system_dark, appearance);
+    if config.appearance.ui_theme != app_config::UiTheme::Omarchy {
+        return;
+    }
+    apply_appearance(
+        &adw::StyleManager::default(),
+        system_prefers_dark,
+        &config.appearance,
+    );
+    reload_app_css(state, &config);
 }
 
 /// Detach a widget from its current parent, if it has one. Safe to call

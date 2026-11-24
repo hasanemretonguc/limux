@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -26,6 +26,12 @@ impl Rgb {
     /// Parse `#RRGGBB`, `#RGB`, or `#RRGGBBAA` (ignoring alpha) into an `Rgb`.
     pub fn parse_hex(raw: &str) -> Option<Self> {
         let hex = raw.trim().strip_prefix('#')?;
+        // Reject anything but ASCII hex digits up front: this keeps the byte
+        // slicing below on char boundaries, validates the ignored alpha byte,
+        // and refuses the `+` sign that `u8::from_str_radix` would accept.
+        if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
         match hex.len() {
             3 => {
                 let r = u8::from_str_radix(&hex[0..1], 16).ok()?;
@@ -114,19 +120,39 @@ fn omarchy_colors_path_in(state_dir: Option<&Path>, config_dir: Option<&Path>) -
     state_candidate.or(config_candidate)
 }
 
-/// Return existing Omarchy directories to monitor for live theme switches.
-pub fn omarchy_watch_dirs() -> Vec<PathBuf> {
+/// Return the directories to monitor for live Omarchy theme switches.
+///
+/// When `omarchy/current` exists, both it (the `theme` symlink is retargeted
+/// there) and `omarchy/current/theme` (in-place `colors.toml` edits) are
+/// watched. When it does not exist yet, the deepest existing ancestor is
+/// watched instead, so installing Omarchy (or its first `omarchy-theme-set`)
+/// after Limux starts still activates live reload once the tree appears.
+fn omarchy_watch_dirs() -> Vec<PathBuf> {
     omarchy_watch_dirs_in(dirs::state_dir().as_deref(), dirs::config_dir().as_deref())
 }
 
 fn omarchy_watch_dirs_in(state_dir: Option<&Path>, config_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs_out = Vec::new();
+    let mut push = |dir: PathBuf| {
+        if !dirs_out.contains(&dir) {
+            dirs_out.push(dir);
+        }
+    };
     for base in [state_dir, config_dir].into_iter().flatten() {
-        for rel in ["omarchy/current", "omarchy/current/theme"] {
-            let candidate = base.join(rel);
-            if candidate.is_dir() && !dirs_out.contains(&candidate) {
-                dirs_out.push(candidate);
+        let current = base.join("omarchy/current");
+        if current.is_dir() {
+            push(current.clone());
+            let theme = current.join("theme");
+            if theme.is_dir() {
+                push(theme);
             }
+            continue;
+        }
+        let omarchy = base.join("omarchy");
+        if omarchy.is_dir() {
+            push(omarchy);
+        } else if base.is_dir() {
+            push(base.to_path_buf());
         }
     }
     dirs_out
@@ -249,10 +275,36 @@ pub fn build_omarchy_css(
     palette: Option<&OmarchyPalette>,
     unread_color_override: Option<&str>,
 ) -> String {
-    let Some(p) = palette else {
-        return build_omarchy_structural_css(unread_color_override);
+    let mut css = match palette {
+        Some(p) => build_omarchy_palette_css(p, unread_color_override),
+        None => build_omarchy_structural_css(unread_color_override),
     };
+    css.push_str(OMARCHY_DROP_INDICATOR_CSS);
+    css
+}
 
+/// The Omarchy layer is loaded after BASE_CSS, and its hover / selected /
+/// unread row rules reset `box-shadow` with higher specificity than BASE_CSS's
+/// `.limux-drop-above` / `.limux-drop-below` rules. Re-assert the sidebar
+/// drag-and-drop insertion lines last, scoped to the row that carries the
+/// drop class, so they win over every row state.
+const OMARCHY_DROP_INDICATOR_CSS: &str = r#"
+.limux-sidebar-list row.limux-drop-above .limux-sidebar-row-box,
+.limux-sidebar-list row.limux-drop-above:hover .limux-sidebar-row-box,
+.limux-sidebar-list row.limux-drop-above:selected .limux-sidebar-row-box {
+    border-radius: 0;
+    box-shadow: 0 -2px 0 0 @accent_bg_color;
+}
+
+.limux-sidebar-list row.limux-drop-below .limux-sidebar-row-box,
+.limux-sidebar-list row.limux-drop-below:hover .limux-sidebar-row-box,
+.limux-sidebar-list row.limux-drop-below:selected .limux-sidebar-row-box {
+    border-radius: 0;
+    box-shadow: 0 2px 0 0 @accent_bg_color;
+}
+"#;
+
+fn build_omarchy_palette_css(p: &OmarchyPalette, unread_color_override: Option<&str>) -> String {
     let bg = p.background;
     let fg = p.foreground;
     let accent = p.accent;
@@ -472,6 +524,17 @@ scrollbar slider {{
     border-color: {accent_hex};
 }}
 
+/* BASE_CSS colors the inner text node through --limux-host-entry-fg, which
+   follows GTK's color scheme rather than Omarchy's polarity. */
+.limux-host-entry text {{
+    color: {fg_hex};
+}}
+
+.limux-host-entry text placeholder,
+.limux-host-entry image {{
+    color: {ws_name_inactive_hex};
+}}
+
 .limux-top-bar {{
     background-color: {bg_hex};
     border-bottom: 1px solid {border_hex};
@@ -557,24 +620,30 @@ scrollbar slider {{
     color: {unread_msg};
 }}
 
-.limux-sidebar-row-unread,
-.limux-sidebar-list row:selected .limux-sidebar-row-box.limux-sidebar-row-unread {{
+/* Coloured workspace rows keep workspace_color.rs styling (white text on
+   the row colour), so the tinted unread background must not replace it. */
+.limux-sidebar-row-unread:not(.limux-ws-colored),
+.limux-sidebar-list row:selected .limux-sidebar-row-box.limux-sidebar-row-unread:not(.limux-ws-colored) {{
     border-radius: 2px;
     margin-left: 4px;
     border-left: 2px solid {unread_border};
     background: {unread_bg};
-    box-shadow: none;
 }}
 
 .limux-sidebar-btn {{
     border-radius: 2px;
-    background: {row_hover_hex};
-    border: 1px solid {btn_border_hex};
-    color: {ws_name_inactive_hex};
     padding: 4px 10px;
 }}
 
-.limux-sidebar-btn:hover {{
+/* Colours skip the trash states so BASE_CSS's error styling still shows
+   while a workspace is dragged over the button. */
+.limux-sidebar-btn:not(.limux-sidebar-btn-trash):not(.limux-sidebar-btn-trash-hover) {{
+    background: {row_hover_hex};
+    border: 1px solid {btn_border_hex};
+    color: {ws_name_inactive_hex};
+}}
+
+.limux-sidebar-btn:not(.limux-sidebar-btn-trash):not(.limux-sidebar-btn-trash-hover):hover {{
     background: {btn_hover_hex};
     border-color: {accent_hex};
     color: {fg_hex};
@@ -710,38 +779,90 @@ scrollbar slider {{
     box-shadow: none;
 }}
 
-.limux-sidebar-row-unread,
-.limux-sidebar-list row:selected .limux-sidebar-row-box.limux-sidebar-row-unread {{
+/* Coloured workspace rows keep workspace_color.rs styling (white text on
+   the row colour), so the tinted unread background must not replace it. */
+.limux-sidebar-row-unread:not(.limux-ws-colored),
+.limux-sidebar-list row:selected .limux-sidebar-row-box.limux-sidebar-row-unread:not(.limux-ws-colored) {{
     border-radius: 2px;
     margin-left: 4px;
     border-left: 2px solid {unread_color};
     background: alpha({unread_color}, 0.10);
-    box-shadow: none;
 }}
 
 .limux-sidebar-btn {{
     border-radius: 2px;
-    border: 1px solid alpha(@window_fg_color, 0.12);
     padding: 4px 10px;
 }}
 
-.limux-sidebar-btn:hover {{
+.limux-sidebar-btn:not(.limux-sidebar-btn-trash):not(.limux-sidebar-btn-trash-hover) {{
+    border: 1px solid alpha(@window_fg_color, 0.12);
+}}
+
+.limux-sidebar-btn:not(.limux-sidebar-btn-trash):not(.limux-sidebar-btn-trash-hover):hover {{
     border-color: @accent_bg_color;
 }}
 "#
     )
 }
 
-/// Watch Omarchy's active theme directories and invoke `on_change` (debounced)
-/// whenever the theme symlink, generation file, or `colors.toml` changes.
-pub fn watch_omarchy_theme<F>(on_change: F) -> Vec<gio::FileMonitor>
-where
-    F: Fn() + 'static,
-{
-    let callback = Rc::new(on_change);
-    let pending_reload: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
-    let mut monitors = Vec::new();
+/// Live-reload watcher for the active Omarchy theme.
+///
+/// Dropping the watcher cancels every monitor and any pending reload, so the
+/// owner stops it by dropping it (when the interface theme leaves Omarchy or
+/// the window closes). Monitor closures only hold a `Weak` reference back to
+/// the watcher, and the watcher holds the caller's callback, so no reference
+/// cycle is created as long as the callback itself captures its state weakly.
+pub struct OmarchyThemeWatcher {
+    inner: Rc<WatcherInner>,
+}
 
+struct WatcherInner {
+    on_change: Box<dyn Fn()>,
+    monitors: RefCell<Vec<gio::FileMonitor>>,
+    pending_reload: Cell<Option<glib::SourceId>>,
+}
+
+impl OmarchyThemeWatcher {
+    /// Start watching Omarchy's theme directories and invoke `on_change`
+    /// (debounced) whenever the theme symlink, generation file, or
+    /// `colors.toml` changes.
+    pub fn start<F>(on_change: F) -> Self
+    where
+        F: Fn() + 'static,
+    {
+        let inner = Rc::new(WatcherInner {
+            on_change: Box::new(on_change),
+            monitors: RefCell::new(Vec::new()),
+            pending_reload: Cell::new(None),
+        });
+        install_monitors(&inner);
+        Self { inner }
+    }
+}
+
+impl Drop for OmarchyThemeWatcher {
+    fn drop(&mut self) {
+        if let Some(source_id) = self.inner.pending_reload.take() {
+            source_id.remove();
+        }
+        for monitor in self.inner.monitors.borrow_mut().drain(..) {
+            monitor.cancel();
+        }
+    }
+}
+
+/// (Re)create the directory monitors.
+///
+/// `gio::File::monitor_directory` resolves symlinks once, so after
+/// `omarchy-theme-set` retargets `omarchy/current/theme` the old monitor keeps
+/// pointing at the previous theme's directory. Rebuilding after every relevant
+/// change re-resolves the symlink, and also picks up directories that did not
+/// exist when Limux started.
+fn install_monitors(inner: &Rc<WatcherInner>) {
+    let mut monitors = inner.monitors.borrow_mut();
+    for monitor in monitors.drain(..) {
+        monitor.cancel();
+    }
     for dir in omarchy_watch_dirs() {
         let file = gio::File::for_path(&dir);
         let Ok(monitor) =
@@ -749,52 +870,64 @@ where
         else {
             continue;
         };
-
-        let callback = callback.clone();
-        let pending_reload = pending_reload.clone();
+        let weak = Rc::downgrade(inner);
         monitor.connect_changed(move |_, changed_file, other_file, _| {
             if !is_relevant_omarchy_theme_change(changed_file, other_file) {
                 return;
             }
-            if let Some(existing) = pending_reload.take() {
-                existing.remove();
+            if let Some(inner) = weak.upgrade() {
+                schedule_reload(&inner);
             }
-            let callback = callback.clone();
-            let pending_reload_inner = pending_reload.clone();
-            let source_id = glib::timeout_add_local_once(
-                Duration::from_millis(OMARCHY_RELOAD_DEBOUNCE_MS),
-                move || {
-                    pending_reload_inner.set(None);
-                    callback();
-                },
-            );
-            pending_reload.set(Some(source_id));
         });
         monitors.push(monitor);
     }
+}
 
-    monitors
+/// Debounce bursts of file events into one rebuild + callback. The rebuild
+/// runs from the timeout rather than inside the monitor's own `changed`
+/// handler, so a monitor is never cancelled while it is emitting.
+fn schedule_reload(inner: &Rc<WatcherInner>) {
+    if let Some(existing) = inner.pending_reload.take() {
+        existing.remove();
+    }
+    let weak = Rc::downgrade(inner);
+    let source_id = glib::timeout_add_local_once(
+        Duration::from_millis(OMARCHY_RELOAD_DEBOUNCE_MS),
+        move || {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            inner.pending_reload.set(None);
+            install_monitors(&inner);
+            (inner.on_change)();
+        },
+    );
+    inner.pending_reload.set(Some(source_id));
 }
 
 fn is_relevant_omarchy_theme_change(changed: &gio::File, other: Option<&gio::File>) -> bool {
     let matches = |file: &gio::File| {
         file.basename()
             .and_then(|name| name.to_str().map(str::to_owned))
-            .is_some_and(|name| {
-                matches!(
-                    name.as_str(),
-                    "theme" | "theme.name" | "theme.generation" | "colors.toml"
-                )
-            })
+            .is_some_and(|name| is_relevant_omarchy_entry_name(&name))
     };
     matches(changed) || other.is_some_and(matches)
+}
+
+/// File names whose creation, removal, or change can alter the active theme.
+/// `omarchy` and `current` cover the tree appearing after Limux started.
+fn is_relevant_omarchy_entry_name(name: &str) -> bool {
+    matches!(
+        name,
+        "omarchy" | "current" | "theme" | "theme.name" | "theme.generation" | "colors.toml"
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_omarchy_css, omarchy_colors_path_in, omarchy_watch_dirs_in, parse_colors_toml,
-        OmarchyPalette, Rgb,
+        build_omarchy_css, is_relevant_omarchy_entry_name, omarchy_colors_path_in,
+        omarchy_watch_dirs_in, parse_colors_toml, OmarchyPalette, Rgb,
     };
 
     const SAMPLE_DARK_COLORS_TOML: &str = r##"
@@ -828,6 +961,21 @@ red = '#d20f39'
         assert_eq!(Rgb::parse_hex("0a0816"), None);
         assert_eq!(Rgb::parse_hex("#zzzzzz"), None);
         assert_eq!(Rgb::parse_hex("#0a0816; } * { color: red;"), None);
+    }
+
+    #[test]
+    fn rgb_rejects_non_ascii_and_signed_hex_without_panicking() {
+        // Multi-byte UTF-8 whose byte length is 3, 6 or 8 must not hit a
+        // non-char-boundary slice.
+        assert_eq!(Rgb::parse_hex("#€"), None);
+        assert_eq!(Rgb::parse_hex("#日本"), None);
+        assert_eq!(Rgb::parse_hex("#ab€de"), None);
+        // `from_str_radix` accepts a leading `+`; the guard must not.
+        assert_eq!(Rgb::parse_hex("#+f+f+f"), None);
+        assert_eq!(Rgb::parse_hex("#+ff"), None);
+        // The ignored alpha byte of `#RRGGBBAA` is still validated.
+        assert_eq!(Rgb::parse_hex("#0a0816zz"), None);
+        assert_eq!(Rgb::parse_hex("#0a0816+f"), None);
     }
 
     #[test]
@@ -874,6 +1022,45 @@ red = '#d20f39'
     }
 
     #[test]
+    fn css_preserves_base_limux_states_it_would_otherwise_override() {
+        let palette = parse_colors_toml(SAMPLE_LIGHT_COLORS_TOML).unwrap();
+        for css in [
+            build_omarchy_css(Some(&palette), None),
+            build_omarchy_css(None, None),
+        ] {
+            // Coloured workspace rows keep workspace_color.rs backgrounds.
+            assert!(css.contains(".limux-sidebar-row-unread:not(.limux-ws-colored)"));
+            assert!(!css.contains(".limux-sidebar-row-unread,\n"));
+            // Trash drop-target styling from BASE_CSS is not recoloured.
+            assert!(css.contains(
+                ".limux-sidebar-btn:not(.limux-sidebar-btn-trash):not(.limux-sidebar-btn-trash-hover):hover"
+            ));
+            assert!(!css.contains(".limux-sidebar-btn:hover"));
+            // Drag-and-drop insertion lines: GTK resolves specificity before
+            // source order, so the restore rules (four classes + one element)
+            // must out-rank every row rule that resets `box-shadow`. Only the
+            // hover / selected rules (three classes + one element) may reset
+            // it; the unread rules carry more classes and must not.
+            assert!(css.contains(
+                ".limux-sidebar-list row.limux-drop-above:selected .limux-sidebar-row-box"
+            ));
+            assert!(css.contains("box-shadow: 0 2px 0 0 @accent_bg_color;"));
+            for block in css.split("}\n") {
+                if block.contains("box-shadow: none;") {
+                    assert!(
+                        !block.contains("limux-sidebar-row-unread"),
+                        "unread rule must not reset box-shadow: {block}"
+                    );
+                }
+            }
+        }
+
+        // The inner text node follows the Omarchy foreground, not GTK's scheme.
+        let palette_css = build_omarchy_css(Some(&palette), None);
+        assert!(palette_css.contains(".limux-host-entry text {\n    color: #4c4f69;"));
+    }
+
+    #[test]
     fn css_respects_explicit_unread_color_override() {
         let palette = parse_colors_toml(SAMPLE_DARK_COLORS_TOML).unwrap();
         let css = build_omarchy_css(Some(&palette), Some("#10b981"));
@@ -916,6 +1103,53 @@ red = '#d20f39'
         assert!(watched.contains(&state_dir.join("omarchy/current")));
         assert!(watched.contains(&state_dir.join("omarchy/current/theme")));
         assert!(watched.contains(&config_dir.join("omarchy/current")));
+    }
+
+    #[test]
+    fn watches_nearest_existing_ancestor_until_omarchy_tree_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let config_dir = temp.path().join("config");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        // Nothing Omarchy-specific yet: watch the XDG base that exists so the
+        // later creation of `omarchy/` is noticed. A missing base is skipped.
+        assert_eq!(
+            omarchy_watch_dirs_in(Some(&state_dir), Some(&config_dir)),
+            vec![state_dir.clone()]
+        );
+
+        std::fs::create_dir_all(state_dir.join("omarchy")).unwrap();
+        assert_eq!(
+            omarchy_watch_dirs_in(Some(&state_dir), Some(&config_dir)),
+            vec![state_dir.join("omarchy")]
+        );
+
+        std::fs::create_dir_all(state_dir.join("omarchy/current/theme")).unwrap();
+        assert_eq!(
+            omarchy_watch_dirs_in(Some(&state_dir), Some(&config_dir)),
+            vec![
+                state_dir.join("omarchy/current"),
+                state_dir.join("omarchy/current/theme"),
+            ]
+        );
+    }
+
+    #[test]
+    fn relevant_entry_names_cover_tree_creation_and_theme_switches() {
+        for name in [
+            "omarchy",
+            "current",
+            "theme",
+            "theme.name",
+            "theme.generation",
+            "colors.toml",
+        ] {
+            assert!(is_relevant_omarchy_entry_name(name), "{name}");
+        }
+        for name in ["gtk.css", "hyprland.conf", "colors.toml~", "background"] {
+            assert!(!is_relevant_omarchy_entry_name(name), "{name}");
+        }
     }
 
     #[test]
