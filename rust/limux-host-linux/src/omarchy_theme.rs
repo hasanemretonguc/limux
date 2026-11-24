@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -26,6 +26,9 @@ impl Rgb {
     /// Parse `#RRGGBB`, `#RGB`, or `#RRGGBBAA` (ignoring alpha) into an `Rgb`.
     pub fn parse_hex(raw: &str) -> Option<Self> {
         let hex = raw.trim().strip_prefix('#')?;
+        if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
         match hex.len() {
             3 => {
                 let r = u8::from_str_radix(&hex[0..1], 16).ok()?;
@@ -114,7 +117,9 @@ fn omarchy_colors_path_in(state_dir: Option<&Path>, config_dir: Option<&Path>) -
     state_candidate.or(config_candidate)
 }
 
-/// Return existing Omarchy directories to monitor for live theme switches.
+/// Return watchable Omarchy directories, falling back to existing parent
+/// directories so live reload still activates if Omarchy creates its theme
+/// directories after Limux starts.
 pub fn omarchy_watch_dirs() -> Vec<PathBuf> {
     omarchy_watch_dirs_in(dirs::state_dir().as_deref(), dirs::config_dir().as_deref())
 }
@@ -122,14 +127,28 @@ pub fn omarchy_watch_dirs() -> Vec<PathBuf> {
 fn omarchy_watch_dirs_in(state_dir: Option<&Path>, config_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs_out = Vec::new();
     for base in [state_dir, config_dir].into_iter().flatten() {
-        for rel in ["omarchy/current", "omarchy/current/theme"] {
-            let candidate = base.join(rel);
-            if candidate.is_dir() && !dirs_out.contains(&candidate) {
-                dirs_out.push(candidate);
+        let current_dir = base.join("omarchy/current");
+        let theme_dir = base.join("omarchy/current/theme");
+        let omarchy_dir = base.join("omarchy");
+
+        if current_dir.is_dir() {
+            push_unique_dir(&mut dirs_out, current_dir);
+            if theme_dir.is_dir() {
+                push_unique_dir(&mut dirs_out, theme_dir);
             }
+        } else if omarchy_dir.is_dir() {
+            push_unique_dir(&mut dirs_out, omarchy_dir);
+        } else if base.is_dir() {
+            push_unique_dir(&mut dirs_out, base.to_path_buf());
         }
     }
     dirs_out
+}
+
+fn push_unique_dir(out: &mut Vec<PathBuf>, dir: PathBuf) {
+    if !out.contains(&dir) {
+        out.push(dir);
+    }
 }
 
 /// Load and parse the active Omarchy theme palette from disk, if present.
@@ -141,8 +160,8 @@ pub fn load_active_palette() -> Option<OmarchyPalette> {
 
 /// Parse Omarchy's `colors.toml` into an `OmarchyPalette`.
 ///
-/// Only strictly validated `#RGB` / `#RRGGBB` / `#RRGGBBAA` hex values are
-/// accepted so malformed theme files cannot inject arbitrary CSS.
+/// Only strictly validated ASCII `#RGB` / `#RRGGBB` / `#RRGGBBAA` hex values
+/// are accepted so malformed theme files cannot panic or inject arbitrary CSS.
 pub fn parse_colors_toml(contents: &str) -> Option<OmarchyPalette> {
     let mut mode: Option<&str> = None;
     let mut background: Option<Rgb> = None;
@@ -275,6 +294,7 @@ pub fn build_omarchy_css(
     let switch_border = bg.mix(fg, 0.17);
     let slider_inactive = fg.mix(bg, 0.22);
     let ws_name_inactive = fg.mix(bg, 0.38);
+    let placeholder_fg = fg.mix(bg, 0.48);
 
     let bg_hex = bg.to_hex();
     let fg_hex = fg.to_hex();
@@ -293,6 +313,7 @@ pub fn build_omarchy_css(
     let switch_border_hex = switch_border.to_hex();
     let slider_inactive_hex = slider_inactive.to_hex();
     let ws_name_inactive_hex = ws_name_inactive.to_hex();
+    let placeholder_fg_hex = placeholder_fg.to_hex();
     let accent_hex = accent.to_hex();
     let accent_fg_hex = accent_fg.to_hex();
     let error_hex = p.error.to_hex();
@@ -472,6 +493,15 @@ scrollbar slider {{
     border-color: {accent_hex};
 }}
 
+.limux-host-entry text {{
+    color: {fg_hex};
+}}
+
+.limux-host-entry text placeholder,
+.limux-host-entry image {{
+    color: {placeholder_fg_hex};
+}}
+
 .limux-top-bar {{
     background-color: {bg_hex};
     border-bottom: 1px solid {border_hex};
@@ -522,17 +552,16 @@ scrollbar slider {{
     border-radius: 2px;
     margin: 1px 4px;
     border-left: 2px solid transparent;
-    box-shadow: none;
     background: transparent;
 }}
 
-.limux-sidebar-list row:hover .limux-sidebar-row-box {{
+.limux-sidebar-list row:not(.limux-drop-above):not(.limux-drop-below):hover .limux-sidebar-row-box:not(.limux-ws-colored) {{
     background: {row_hover_hex};
     box-shadow: none;
 }}
 
-.limux-sidebar-list row:selected .limux-sidebar-row-box,
-.limux-sidebar-list row:selected:hover .limux-sidebar-row-box {{
+.limux-sidebar-list row:not(.limux-drop-above):not(.limux-drop-below):selected .limux-sidebar-row-box:not(.limux-ws-colored),
+.limux-sidebar-list row:not(.limux-drop-above):not(.limux-drop-below):selected:hover .limux-sidebar-row-box:not(.limux-ws-colored) {{
     background: {row_selected_hex};
     border-left: 2px solid {accent_hex};
     box-shadow: none;
@@ -557,8 +586,8 @@ scrollbar slider {{
     color: {unread_msg};
 }}
 
-.limux-sidebar-row-unread,
-.limux-sidebar-list row:selected .limux-sidebar-row-box.limux-sidebar-row-unread {{
+.limux-sidebar-row-unread:not(.limux-ws-colored),
+.limux-sidebar-list row:not(.limux-drop-above):not(.limux-drop-below):selected .limux-sidebar-row-box.limux-sidebar-row-unread:not(.limux-ws-colored) {{
     border-radius: 2px;
     margin-left: 4px;
     border-left: 2px solid {unread_border};
@@ -566,7 +595,7 @@ scrollbar slider {{
     box-shadow: none;
 }}
 
-.limux-sidebar-btn {{
+.limux-sidebar-btn:not(.limux-sidebar-btn-trash):not(.limux-sidebar-btn-trash-hover) {{
     border-radius: 2px;
     background: {row_hover_hex};
     border: 1px solid {btn_border_hex};
@@ -574,7 +603,7 @@ scrollbar slider {{
     padding: 4px 10px;
 }}
 
-.limux-sidebar-btn:hover {{
+.limux-sidebar-btn:not(.limux-sidebar-btn-trash):not(.limux-sidebar-btn-trash-hover):hover {{
     background: {btn_hover_hex};
     border-color: {accent_hex};
     color: {fg_hex};
@@ -694,24 +723,23 @@ scrollbar slider {{
     border-radius: 2px;
     margin: 1px 4px;
     border-left: 2px solid transparent;
-    box-shadow: none;
     background: transparent;
 }}
 
-.limux-sidebar-list row:hover .limux-sidebar-row-box {{
+.limux-sidebar-list row:not(.limux-drop-above):not(.limux-drop-below):hover .limux-sidebar-row-box:not(.limux-ws-colored) {{
     background: alpha(@window_fg_color, 0.05);
     box-shadow: none;
 }}
 
-.limux-sidebar-list row:selected .limux-sidebar-row-box,
-.limux-sidebar-list row:selected:hover .limux-sidebar-row-box {{
+.limux-sidebar-list row:not(.limux-drop-above):not(.limux-drop-below):selected .limux-sidebar-row-box:not(.limux-ws-colored),
+.limux-sidebar-list row:not(.limux-drop-above):not(.limux-drop-below):selected:hover .limux-sidebar-row-box:not(.limux-ws-colored) {{
     background: alpha(@window_fg_color, 0.08);
     border-left: 2px solid @accent_bg_color;
     box-shadow: none;
 }}
 
-.limux-sidebar-row-unread,
-.limux-sidebar-list row:selected .limux-sidebar-row-box.limux-sidebar-row-unread {{
+.limux-sidebar-row-unread:not(.limux-ws-colored),
+.limux-sidebar-list row:not(.limux-drop-above):not(.limux-drop-below):selected .limux-sidebar-row-box.limux-sidebar-row-unread:not(.limux-ws-colored) {{
     border-radius: 2px;
     margin-left: 4px;
     border-left: 2px solid {unread_color};
@@ -719,61 +747,136 @@ scrollbar slider {{
     box-shadow: none;
 }}
 
-.limux-sidebar-btn {{
+.limux-sidebar-btn:not(.limux-sidebar-btn-trash):not(.limux-sidebar-btn-trash-hover) {{
     border-radius: 2px;
     border: 1px solid alpha(@window_fg_color, 0.12);
     padding: 4px 10px;
 }}
 
-.limux-sidebar-btn:hover {{
+.limux-sidebar-btn:not(.limux-sidebar-btn-trash):not(.limux-sidebar-btn-trash-hover):hover {{
     border-color: @accent_bg_color;
 }}
 "#
     )
 }
 
-/// Watch Omarchy's active theme directories and invoke `on_change` (debounced)
-/// whenever the theme symlink, generation file, or `colors.toml` changes.
-pub fn watch_omarchy_theme<F>(on_change: F) -> Vec<gio::FileMonitor>
-where
-    F: Fn() + 'static,
-{
-    let callback = Rc::new(on_change);
-    let pending_reload: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
-    let mut monitors = Vec::new();
+/// Manages `gio::FileMonitor` watches for Omarchy theme directories,
+/// automatically re-attaching monitors when `omarchy/current/theme` symlinks
+/// are retargeted or created after startup, and cancelling cleanly on stop/drop.
+pub struct OmarchyThemeWatcher {
+    inner: Rc<RefCell<WatcherInner>>,
+}
 
-    for dir in omarchy_watch_dirs() {
-        let file = gio::File::for_path(&dir);
-        let Ok(monitor) =
-            file.monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
-        else {
-            continue;
-        };
+struct WatcherInner {
+    monitors: Vec<gio::FileMonitor>,
+    pending_reload: Option<glib::SourceId>,
+    callback: Rc<dyn Fn()>,
+    stopped: bool,
+}
 
-        let callback = callback.clone();
-        let pending_reload = pending_reload.clone();
-        monitor.connect_changed(move |_, changed_file, other_file, _| {
-            if !is_relevant_omarchy_theme_change(changed_file, other_file) {
-                return;
-            }
-            if let Some(existing) = pending_reload.take() {
-                existing.remove();
-            }
-            let callback = callback.clone();
-            let pending_reload_inner = pending_reload.clone();
-            let source_id = glib::timeout_add_local_once(
-                Duration::from_millis(OMARCHY_RELOAD_DEBOUNCE_MS),
-                move || {
-                    pending_reload_inner.set(None);
-                    callback();
-                },
-            );
-            pending_reload.set(Some(source_id));
-        });
-        monitors.push(monitor);
+impl OmarchyThemeWatcher {
+    pub fn start<F>(on_change: F) -> Self
+    where
+        F: Fn() + 'static,
+    {
+        let inner = Rc::new(RefCell::new(WatcherInner {
+            monitors: Vec::new(),
+            pending_reload: None,
+            callback: Rc::new(on_change),
+            stopped: false,
+        }));
+        Self::reattach_monitors(&inner);
+        Self { inner }
     }
 
-    monitors
+    pub fn stop(&self) {
+        let mut inner = self.inner.borrow_mut();
+        inner.stopped = true;
+        if let Some(source) = inner.pending_reload.take() {
+            source.remove();
+        }
+        for monitor in inner.monitors.drain(..) {
+            monitor.cancel();
+        }
+    }
+
+    fn reattach_monitors(inner: &Rc<RefCell<WatcherInner>>) {
+        {
+            let mut state = inner.borrow_mut();
+            if state.stopped {
+                return;
+            }
+            for monitor in state.monitors.drain(..) {
+                monitor.cancel();
+            }
+        }
+
+        let mut new_monitors = Vec::new();
+        for dir in omarchy_watch_dirs() {
+            let file = gio::File::for_path(&dir);
+            let Ok(monitor) =
+                file.monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
+            else {
+                continue;
+            };
+
+            let weak_inner = Rc::downgrade(inner);
+            monitor.connect_changed(move |_, changed_file, other_file, _| {
+                if !is_relevant_omarchy_theme_change(changed_file, other_file) {
+                    return;
+                }
+                let needs_reattach = is_omarchy_dir_or_symlink_change(changed_file, other_file);
+                let Some(inner) = weak_inner.upgrade() else {
+                    return;
+                };
+                let mut state = inner.borrow_mut();
+                if state.stopped {
+                    return;
+                }
+                if let Some(existing) = state.pending_reload.take() {
+                    existing.remove();
+                }
+                let weak_for_timer = Rc::downgrade(&inner);
+                let source_id = glib::timeout_add_local_once(
+                    Duration::from_millis(OMARCHY_RELOAD_DEBOUNCE_MS),
+                    move || {
+                        let Some(inner) = weak_for_timer.upgrade() else {
+                            return;
+                        };
+                        let callback = {
+                            let mut state = inner.borrow_mut();
+                            state.pending_reload = None;
+                            if state.stopped {
+                                return;
+                            }
+                            state.callback.clone()
+                        };
+                        if needs_reattach {
+                            Self::reattach_monitors(&inner);
+                        }
+                        callback();
+                    },
+                );
+                state.pending_reload = Some(source_id);
+            });
+            new_monitors.push(monitor);
+        }
+
+        let mut state = inner.borrow_mut();
+        if state.stopped {
+            for monitor in new_monitors {
+                monitor.cancel();
+            }
+        } else {
+            state.monitors = new_monitors;
+        }
+    }
+}
+
+impl Drop for OmarchyThemeWatcher {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 fn is_relevant_omarchy_theme_change(changed: &gio::File, other: Option<&gio::File>) -> bool {
@@ -783,9 +886,23 @@ fn is_relevant_omarchy_theme_change(changed: &gio::File, other: Option<&gio::Fil
             .is_some_and(|name| {
                 matches!(
                     name.as_str(),
-                    "theme" | "theme.name" | "theme.generation" | "colors.toml"
+                    "omarchy"
+                        | "current"
+                        | "theme"
+                        | "theme.name"
+                        | "theme.generation"
+                        | "colors.toml"
                 )
             })
+    };
+    matches(changed) || other.is_some_and(matches)
+}
+
+fn is_omarchy_dir_or_symlink_change(changed: &gio::File, other: Option<&gio::File>) -> bool {
+    let matches = |file: &gio::File| {
+        file.basename()
+            .and_then(|name| name.to_str().map(str::to_owned))
+            .is_some_and(|name| matches!(name.as_str(), "omarchy" | "current" | "theme"))
     };
     matches(changed) || other.is_some_and(matches)
 }
@@ -821,12 +938,16 @@ red = '#d20f39'
 "#;
 
     #[test]
-    fn rgb_parses_short_long_and_alpha_hex() {
+    fn rgb_parses_short_long_and_alpha_hex_and_rejects_malformed_utf8() {
         assert_eq!(Rgb::parse_hex("#fff"), Some(Rgb::new(255, 255, 255)));
         assert_eq!(Rgb::parse_hex("#0a0816"), Some(Rgb::new(10, 8, 22)));
         assert_eq!(Rgb::parse_hex("#e37057cc"), Some(Rgb::new(227, 112, 87)));
         assert_eq!(Rgb::parse_hex("0a0816"), None);
         assert_eq!(Rgb::parse_hex("#zzzzzz"), None);
+        assert_eq!(Rgb::parse_hex("#e37057zz"), None);
+        assert_eq!(Rgb::parse_hex("#+12345"), None);
+        assert_eq!(Rgb::parse_hex("#€"), None);
+        assert_eq!(Rgb::parse_hex("#日本"), None);
         assert_eq!(Rgb::parse_hex("#0a0816; } * { color: red;"), None);
     }
 
@@ -863,14 +984,17 @@ red = '#d20f39'
     }
 
     #[test]
-    fn css_includes_dynamic_omarchy_tokens_and_sharp_sidebar_rules() {
+    fn css_preserves_colored_rows_trash_buttons_drop_indicators_and_entry_text() {
         let palette = parse_colors_toml(SAMPLE_DARK_COLORS_TOML).unwrap();
         let css = build_omarchy_css(Some(&palette), None);
         assert!(css.contains("@define-color window_bg_color #0a0816;"));
         assert!(css.contains("@define-color accent_bg_color #e37057;"));
         assert!(css.contains("border-left: 2px solid #e37057;"));
         assert!(css.contains("border-left: 2px solid #ffbe71;"));
-        assert!(css.contains("box-shadow: none;"));
+        assert!(css.contains(":not(.limux-ws-colored)"));
+        assert!(css.contains(":not(.limux-sidebar-btn-trash):not(.limux-sidebar-btn-trash-hover)"));
+        assert!(css.contains(":not(.limux-drop-above):not(.limux-drop-below)"));
+        assert!(css.contains(".limux-host-entry text"));
     }
 
     #[test]
@@ -890,10 +1014,18 @@ red = '#d20f39'
     }
 
     #[test]
-    fn resolves_state_path_before_config_fallback() {
+    fn resolves_state_path_and_parent_watch_fallback() {
         let temp = tempfile::tempdir().unwrap();
         let state_dir = temp.path().join("state");
         let config_dir = temp.path().join("config");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        // Before omarchy dirs exist, watch dirs fall back to existing XDG parents.
+        let initial_watched = omarchy_watch_dirs_in(Some(&state_dir), Some(&config_dir));
+        assert!(initial_watched.contains(&state_dir));
+        assert!(initial_watched.contains(&config_dir));
+
         let config_colors = config_dir.join("omarchy/current/theme/colors.toml");
         std::fs::create_dir_all(config_colors.parent().unwrap()).unwrap();
         std::fs::write(&config_colors, SAMPLE_DARK_COLORS_TOML).unwrap();

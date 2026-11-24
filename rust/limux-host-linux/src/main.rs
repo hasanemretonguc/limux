@@ -26,6 +26,7 @@ mod ssh_session;
 mod ssh_transfer;
 mod tab_activity;
 mod terminal;
+mod terminal_font;
 mod window;
 mod workspace_color;
 mod workspace_group;
@@ -247,10 +248,10 @@ fn main() {
 
     prepare_ghostty_runtime();
     sanitize_terminal_child_env();
-    #[cfg(feature = "webkit")]
-    if let Err(error) = browser_sandbox::availability() {
-        eprintln!("limux: {error}");
-    }
+    // Snapshot browser runtime flags before stripping the launcher sentinel so
+    // shells never inherit it while deferring the WebKit sandbox probe until a
+    // browser surface is actually requested.
+    browser_sandbox::capture_launch_env();
     std::env::remove_var("LIMUX_APPIMAGE_WEBKIT_UNAVAILABLE");
 
     // Initialize Ghostty before GTK app starts
@@ -272,6 +273,7 @@ fn main() {
         window::build_window(app);
     });
     app.run();
+    browser_sandbox::cancel_and_join_on_shutdown();
 }
 
 #[cfg(test)]
