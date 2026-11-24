@@ -1,0 +1,57 @@
+name: Sync Upstream Limux
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    if: github.repository == 'hasanemretonguc/limux'
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch upstream am-will/limux
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/am-will/limux.git
+          git fetch upstream main
+
+      - name: Merge upstream/main if ahead
+        id: merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BEHIND=$(git rev-list --count HEAD..upstream/main)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          if [ "$BEHIND" -eq 0 ]; then
+            echo "Already up to date with upstream/main."
+            exit 0
+          fi
+
+          NEW_COMMITS=$(git log --oneline HEAD..upstream/main)
+          if git merge --no-edit upstream/main; then
+            git push origin main
+            echo "merged=true" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort || true
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            EXISTING=$(gh issue list --state open --search "Upstream sync conflict in:title" --json number -q '.[0].number')
+            BODY=$(printf "Automatic sync with \`am-will/limux:main\` encountered a merge conflict.\n\n### New upstream commits (%s)\n\`\`\`\n%s\n\`\`\`\n\nRun \`./scripts/sync-and-install.sh\` locally (or resolve in Limux) to merge." "$BEHIND" "$NEW_COMMITS")
+            if [ -n "$EXISTING" ]; then
+              gh issue comment "$EXISTING" --body "$BODY"
+            else
+              gh issue create --title "Upstream sync conflict with am-will/limux" --body "$BODY"
+            fi
+          fi
