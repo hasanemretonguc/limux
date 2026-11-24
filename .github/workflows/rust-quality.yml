@@ -212,6 +212,15 @@ jobs:
           LIMUX_VISUAL_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: uv run scripts/ci-native-crashes.py run -- ./scripts/ci-webkit-sandbox.sh -- ./scripts/tests/visual-smoke-test.sh
 
+      - name: Capture Limux visual smoke states (Omarchy theme)
+        if: always() && !cancelled()
+        timeout-minutes: 5
+        env:
+          LIMUX_VISUAL_OMARCHY: "1"
+          LIMUX_VISUAL_SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/limux-visual-smoke
+          LIMUX_VISUAL_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: uv run scripts/ci-native-crashes.py run -- ./scripts/ci-webkit-sandbox.sh -- ./scripts/tests/visual-smoke-test.sh
+
       - name: Collect native crash diagnostics
         if: always() && steps.native-crashes.outcome == 'success'
         timeout-minutes: 7

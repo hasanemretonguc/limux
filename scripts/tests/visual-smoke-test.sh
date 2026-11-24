@@ -70,6 +70,19 @@ unset GDK_DEBUG GSK_DEBUG GSK_RENDERER http_proxy https_proxy all_proxy HTTP_PRO
 export no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
 printf 'command = /bin/sh\nshell-integration = none\nfont-size = 12\n' >"$XDG_CONFIG_HOME/ghostty/config"
 
+# Optional Omarchy run: lay out Omarchy's state tree exactly as
+# omarchy-theme-set leaves it and select the Omarchy interface theme.
+if [ "${LIMUX_VISUAL_OMARCHY:-}" = 1 ]; then
+  OMARCHY_FIXTURES="$TOOLING_ROOT/scripts/tests/fixtures/omarchy"
+  OMARCHY_CURRENT="$XDG_STATE_HOME/omarchy/current"
+  mkdir -p "$OMARCHY_CURRENT/theme" "$XDG_CONFIG_HOME/limux"
+  cp "$OMARCHY_FIXTURES/tokyo-night.colors.toml" "$OMARCHY_CURRENT/theme/colors.toml"
+  echo tokyo-night >"$OMARCHY_CURRENT/theme.name"
+  printf '{"appearance":{"ui_theme":"omarchy"}}\n' >"$XDG_CONFIG_HOME/limux/settings.json"
+  export LIMUX_VISUAL_OMARCHY_CURRENT="$OMARCHY_CURRENT"
+  export LIMUX_VISUAL_OMARCHY_FIXTURES="$OMARCHY_FIXTURES"
+fi
+
 result=0
 xvfb-run -a -s '-screen 0 1440x1000x24 -nolisten tcp' \
   dbus-run-session --config-file="$RUN_DIR/dbus.conf" -- bash "$0" --inside || result=$?
@@ -340,6 +353,40 @@ if xdotool search --all --onlyvisible --pid "$HOST_PID" --name '^Settings$' >/de
 fi
 SETTINGS_WINDOW=""
 cli identify >"$LOG_DIR/after-settings.json"
+
+if [ -n "${LIMUX_VISUAL_OMARCHY_CURRENT:-}" ]; then
+  OMARCHY_CURRENT="$LIMUX_VISUAL_OMARCHY_CURRENT"
+  OMARCHY_FIXTURES="$LIMUX_VISUAL_OMARCHY_FIXTURES"
+  cli select-workspace --workspace "$ORIGINAL_ID" >/dev/null
+  # A coloured workspace and two unread workspaces exercise the sidebar
+  # states the Omarchy layer must leave to BASE_CSS / workspace_color.rs.
+  COLOR_JSON="$(cli new-workspace --cwd "$RUN_DIR")"
+  COLOR_ID="$(jq -r '.workspace_id // .workspace_ref // empty' <<<"$COLOR_JSON")"
+  cli rename-workspace --workspace "$COLOR_ID" 'Coloured Unread' >/dev/null
+  cli set-workspace-color --workspace "$COLOR_ID" blue >"$LOG_DIR/omarchy-color.json" 2>&1 || true
+  cli select-workspace --workspace "$ORIGINAL_ID" >/dev/null
+  cli notify --workspace "$COLOR_ID" --title 'Build finished' --body 'colored row' >/dev/null 2>&1 || true
+  cli notify --workspace "$VISUAL_ID" --title 'Agent waiting' --body 'plain row' >/dev/null 2>&1 || true
+  resize_window 1320 820
+  capture omarchy-dark-sidebar 'Omarchy tokyo-night: selected, unread and coloured unread rows'
+
+  # Mirror omarchy-theme-set: stage next-theme, replace the theme directory,
+  # then record the name. The watcher must follow the replaced directory.
+  rm -rf "$OMARCHY_CURRENT/next-theme"
+  mkdir -p "$OMARCHY_CURRENT/next-theme"
+  cp "$OMARCHY_FIXTURES/catppuccin-latte.colors.toml" "$OMARCHY_CURRENT/next-theme/colors.toml"
+  rm -rf "$OMARCHY_CURRENT/theme"
+  mv "$OMARCHY_CURRENT/next-theme" "$OMARCHY_CURRENT/theme"
+  echo catppuccin-latte >"$OMARCHY_CURRENT/theme.name"
+  sleep 1.5
+  capture omarchy-light-after-switch 'Omarchy live reload: catppuccin-latte after omarchy-theme-set'
+
+  # An in-place edit inside the new directory proves the monitor re-armed.
+  sed -i 's/^accent = .*/accent = "#d20f39"/' "$OMARCHY_CURRENT/theme/colors.toml"
+  sleep 1.5
+  capture omarchy-light-inplace-edit 'Omarchy live reload: red accent edited in place after the switch'
+  kill -0 "$HOST_PID" || { echo 'FAIL: host exited during Omarchy reload'; exit 1; }
+fi
 
 SOURCE_SHA="${LIMUX_VISUAL_SOURCE_SHA:-$(git -C "$SOURCE_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)}"
 printf 'Result: PASS\nSource: %s\nScenarios:\n' "$SOURCE_SHA" >"$ARTIFACT_DIR/summary.txt"
