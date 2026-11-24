@@ -1,0 +1,105 @@
+name: Fork Release (Arch Package)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-arch-pkg:
+    runs-on: ubuntu-latest
+    if: github.repository == 'hasanemretonguc/limux'
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Install Arch build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            git rust cargo pkgconf curl tar zstd \
+            gtk4 libadwaita webkitgtk-6.0 fontconfig pango glib2 hicolor-icon-theme \
+            github-cli
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - name: Stage prebuilt libghostty-internal.so from upstream release
+        run: |
+          set -euo pipefail
+          BASE_VER="$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          TARBALL_URL="https://github.com/am-will/limux/releases/download/v${BASE_VER}/limux-${BASE_VER}-linux-x86_64.tar.gz"
+          echo "Downloading Ghostty runtime from ${TARBALL_URL}..."
+          curl -fSL "$TARBALL_URL" -o /tmp/upstream-limux.tar.gz
+          mkdir -p /tmp/upstream-limux ghostty/zig-out/lib ghostty/zig-out/share
+          tar -xzf /tmp/upstream-limux.tar.gz -C /tmp/upstream-limux --strip-components=1
+          cp /tmp/upstream-limux/lib/libghostty-internal.so ghostty/zig-out/lib/libghostty-internal.so
+          if [ -d /tmp/upstream-limux/share/limux/ghostty ]; then
+            cp -r /tmp/upstream-limux/share/limux/ghostty ghostty/zig-out/share/ghostty
+          fi
+
+      - name: Cache Cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: arch-limux-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            arch-limux-cargo-
+
+      - name: Build release binaries
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/ghostty/zig-out/lib
+        run: |
+          cargo build --release --locked -p limux-host-linux -p limux-cli
+
+      - name: Package Arch Linux .pkg.tar.zst
+        id: pkg
+        run: |
+          set -euo pipefail
+          useradd -m builder || true
+          chown -R builder:builder "${{ github.workspace }}"
+          mkdir -p /tmp/pkg-build
+          cp packaging/arch/PKGBUILD /tmp/pkg-build/PKGBUILD
+          chown -R builder:builder /tmp/pkg-build
+          su - builder -c "cd /tmp/pkg-build && LIMUX_REPO_ROOT='${{ github.workspace }}' makepkg -f --noconfirm"
+          mkdir -p dist-arch
+          cp /tmp/pkg-build/limux-custom-git-*.pkg.tar.zst dist-arch/
+          PKG_FILE="$(basename dist-arch/limux-custom-git-*.pkg.tar.zst)"
+          PKG_VER="$(echo "$PKG_FILE" | sed 's/^limux-custom-git-\(.*\)-x86_64\.pkg\.tar\.zst$/\1/')"
+          (cd dist-arch && sha256sum "$PKG_FILE" > SHA256SUMS)
+          echo "pkg_file=$PKG_FILE" >> "$GITHUB_OUTPUT"
+          echo "pkg_ver=$PKG_VER" >> "$GITHUB_OUTPUT"
+          echo "tag=v${PKG_VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.pkg.outputs.tag }}"
+          PKG_FILE="${{ steps.pkg.outputs.pkg_file }}"
+          COMMIT_MSG="$(git log -1 --pretty=%B)"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "dist-arch/$PKG_FILE" "dist-arch/SHA256SUMS" --clobber
+          else
+            gh release create "$TAG" \
+              "dist-arch/$PKG_FILE" \
+              "dist-arch/SHA256SUMS" \
+              --title "Limux Custom ${TAG}" \
+              --notes "Automated Arch Linux release build from \`main\` (\`$(git rev-parse --short HEAD)\`).
+
+${COMMIT_MSG}
+
+### Install / Update
+\`\`\`bash
+limux-update
+\`\`\`" \
+              --latest
+          fi
