@@ -85,7 +85,10 @@ jobs:
           set -euo pipefail
           TAG="${{ steps.pkg.outputs.tag }}"
           PKG_FILE="${{ steps.pkg.outputs.pkg_file }}"
-          COMMIT_MSG="$(git log -1 --pretty=%B)"
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          COMMIT_SUBJECT="$(git log -1 --pretty=%s)"
+          NOTES_FILE="/tmp/release-notes.md"
+          printf 'Automated Arch Linux release build from `main` (`%s`).\n\n- %s\n\n### Install / Update\n```bash\nlimux-update\n```\n' "$SHORT_SHA" "$COMMIT_SUBJECT" > "$NOTES_FILE"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "dist-arch/$PKG_FILE" "dist-arch/SHA256SUMS" --clobber
           else
@@ -93,13 +96,6 @@ jobs:
               "dist-arch/$PKG_FILE" \
               "dist-arch/SHA256SUMS" \
               --title "Limux Custom ${TAG}" \
-              --notes "Automated Arch Linux release build from \`main\` (\`$(git rev-parse --short HEAD)\`).
-
-${COMMIT_MSG}
-
-### Install / Update
-\`\`\`bash
-limux-update
-\`\`\`" \
+              --notes-file "$NOTES_FILE" \
               --latest
           fi

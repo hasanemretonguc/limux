@@ -6199,7 +6199,7 @@ fn active_window(state: &State) -> Option<gtk::Window> {
 
 fn show_workspace_path_dialog(state: &State) {
     let dialog = gtk::Window::builder()
-        .title("Open Project or Folder as Workspace")
+        .title("Open Folder as Workspace")
         .modal(true)
         .default_width(560)
         .default_height(460)
