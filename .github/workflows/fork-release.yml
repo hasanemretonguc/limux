@@ -54,22 +54,22 @@ jobs:
             arch-limux-cargo-
 
       - name: Build release binaries
-        env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/ghostty/zig-out/lib
         run: |
-          cargo build --release --locked -p limux-host-linux -p limux-cli
+          set -euo pipefail
+          LD_LIBRARY_PATH="$PWD/ghostty/zig-out/lib" \
+            cargo build --release --locked -p limux-host-linux -p limux-cli
 
       - name: Package Arch Linux .pkg.tar.zst
         id: pkg
         run: |
           set -euo pipefail
+          WORKSPACE="$PWD"
           useradd -m builder || true
-          chown -R builder:builder "${{ github.workspace }}"
-          mkdir -p /tmp/pkg-build
+          rm -rf /tmp/pkg-build dist-arch
+          mkdir -p /tmp/pkg-build dist-arch
           cp packaging/arch/PKGBUILD /tmp/pkg-build/PKGBUILD
           chown -R builder:builder /tmp/pkg-build
-          su - builder -c "cd /tmp/pkg-build && LIMUX_REPO_ROOT='${{ github.workspace }}' makepkg -f --noconfirm"
-          mkdir -p dist-arch
+          su - builder -c "git config --global --add safe.directory '$WORKSPACE' && cd /tmp/pkg-build && LIMUX_REPO_ROOT='$WORKSPACE' makepkg -f --noconfirm"
           cp /tmp/pkg-build/limux-custom-git-*.pkg.tar.zst dist-arch/
           PKG_FILE="$(basename dist-arch/limux-custom-git-*.pkg.tar.zst)"
           PKG_VER="$(echo "$PKG_FILE" | sed 's/^limux-custom-git-\(.*\)-x86_64\.pkg\.tar\.zst$/\1/')"
@@ -83,6 +83,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          git config --global --add safe.directory "$PWD"
           TAG="${{ steps.pkg.outputs.tag }}"
           PKG_FILE="${{ steps.pkg.outputs.pkg_file }}"
           SHORT_SHA="$(git rev-parse --short HEAD)"
