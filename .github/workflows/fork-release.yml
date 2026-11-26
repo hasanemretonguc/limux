@@ -64,12 +64,13 @@ jobs:
         run: |
           set -euo pipefail
           WORKSPACE="$PWD"
+          git config --system --add safe.directory '*'
           useradd -m builder || true
           rm -rf /tmp/pkg-build dist-arch
           mkdir -p /tmp/pkg-build dist-arch
           cp packaging/arch/PKGBUILD /tmp/pkg-build/PKGBUILD
           chown -R builder:builder /tmp/pkg-build
-          su - builder -c "git config --global --add safe.directory '$WORKSPACE' && cd /tmp/pkg-build && LIMUX_REPO_ROOT='$WORKSPACE' makepkg -f --noconfirm"
+          su - builder -c "cd /tmp/pkg-build && LIMUX_REPO_ROOT='$WORKSPACE' makepkg -f --noconfirm"
           cp /tmp/pkg-build/limux-custom-git-*.pkg.tar.zst dist-arch/
           PKG_FILE="$(basename dist-arch/limux-custom-git-*.pkg.tar.zst)"
           PKG_VER="$(echo "$PKG_FILE" | sed 's/^limux-custom-git-\(.*\)-x86_64\.pkg\.tar\.zst$/\1/')"

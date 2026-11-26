@@ -19,8 +19,8 @@ pkgver() {
     cd "$_repo_root"
     local base_ver rev hash
     base_ver="$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
-    rev="$(git rev-list --count HEAD)"
-    hash="$(git rev-parse --short HEAD)"
+    rev="$(git -c safe.directory="$_repo_root" rev-list --count HEAD)"
+    hash="$(git -c safe.directory="$_repo_root" rev-parse --short HEAD)"
     printf "%s.r%s.g%s" "$base_ver" "$rev" "$hash"
 }
 
